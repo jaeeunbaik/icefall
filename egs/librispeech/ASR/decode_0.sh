@@ -24,5 +24,5 @@ CUDA_VISIBLE_DEVICES=0 python ./conformer_ctc_sd/decode.py \
     --max-duration 10 \
     --epoch 9 \
     --avg 4 \
-    --exp-dir conformer_ctc_sd/train70000-epoch77-avg10/exp_mse_20:1_single/models
+    --exp-dir conformer_ctc_sd/train70000-epoch77-avg10/exp_cs_20:1_single/models
 
