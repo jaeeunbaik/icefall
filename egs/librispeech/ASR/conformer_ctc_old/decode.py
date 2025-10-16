@@ -129,14 +129,14 @@ def get_parser():
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="conformer_ctc_sd/exp/models",
+        default="conformer_ctc/exp/models",
         help="The experiment dir",
     )
 
     parser.add_argument(
         "--lang-dir",
         type=str,
-        default="data/lang_bpe_1024",
+        default="data/lang_bpe_5000",
         help="The lang dir (using BPE)",
     )
 
@@ -217,14 +217,13 @@ def get_params() -> AttributeDict:
             "use_feat_batchnorm": True,
             "feature_dim": 80,
             "nhead": 4,
-            "num_classes": 1024,
             "attention_dim": 256,
             "num_decoder_layers": 0,
             # parameters for decoding
-            "search_beam": 20,    
-            "output_beam": 8,  
-            "min_active_states": 30,   # 30에서 5로 감소
-            "max_active_states": 1000,  # 1000에서 50으로 대폭 감소
+            "search_beam": 20,
+            "output_beam": 8,
+            "min_active_states": 30,
+            "max_active_states": 1000,
             "use_double_scores": True,
             "env_info": get_env_info(),
         }
@@ -306,21 +305,9 @@ def decode_one_batch(
 
     supervisions = batch["supervisions"]
     
-    # Step 1: Model forward pass  
-    # Extract x_lens from supervisions for Conformer forward pass
-    x_lens = supervisions["num_frames"]
-    
-    # Ensure x_lens is on the same device as feature
-    if isinstance(x_lens, torch.Tensor):
-        x_lens = x_lens.to(device)
-    else:
-        # Convert to tensor if needed and move to device
-        x_lens = torch.tensor(x_lens).to(device)
-    
-    # ConformerCTC forward requires (feature, supervisions) - but we'll pass None for supervisions during inference
-
-    nnet_output, memory, memory_key_padding_mask, _, _ = model(feature, None)
-    
+    # Step 1: Model forward pass
+    nnet_output, memory, memory_key_padding_mask = model(feature, supervisions)
+    # nnet_output is (N, T, C)
     
     # Step 2: Supervision segments preparation
     supervision_segments = torch.stack(
@@ -331,6 +318,7 @@ def decode_one_batch(
         ),
         1,
     ).to(torch.int32)
+
     
     # Ensure supervision segments don't exceed nnet_output length
     max_allowed_frames = nnet_output.size(1)
@@ -347,24 +335,18 @@ def decode_one_batch(
         assert bpe_model is not None
         decoding_graph = H
     
-    try:
-        lattice = get_lattice(
-            nnet_output=nnet_output,
-            decoding_graph=decoding_graph,
-            supervision_segments=supervision_segments,
-            search_beam=params.search_beam,
-            output_beam=params.output_beam,
-            min_active_states=params.min_active_states,
-            max_active_states=params.max_active_states,
-            subsampling_factor=params.subsampling_factor,
-        )
-        logging.info("Successfully created lattice")
-    except Exception as e:
-        logging.error(f"Error in get_lattice: {str(e)}")
-        logging.error(f"Exception type: {type(e).__name__}")
-        import traceback
-        logging.error(f"Traceback: {traceback.format_exc()}")
-        raise e
+    # Step 3: Lattice generation
+    lattice = get_lattice(
+        nnet_output=nnet_output,
+        decoding_graph=decoding_graph,
+        supervision_segments=supervision_segments,
+        search_beam=params.search_beam,
+        output_beam=params.output_beam,
+        min_active_states=params.min_active_states,
+        max_active_states=params.max_active_states,
+        subsampling_factor=params.subsampling_factor,
+    )
+
     if params.method == "ctc-decoding":
         # Step 4: CTC decoding
         best_path = one_best_decoding(
@@ -580,7 +562,7 @@ def decode_dataset(
             eos_id=eos_id,
             G=G,
         )
-        print(f'hyps_dict returned')
+        
         if hyps_dict is not None:
             for lm_scale, hyps in hyps_dict.items():
                 this_batch = []
@@ -823,10 +805,11 @@ def main():
 
     model = Conformer(
         num_features=params.feature_dim,
-        num_classes=params.num_classes,
-        num_decoder_layers=0,
         nhead=params.nhead,
+        d_model=params.attention_dim,
+        num_classes=num_classes,
         subsampling_factor=params.subsampling_factor,
+        num_decoder_layers=params.num_decoder_layers,
         vgg_frontend=params.vgg_frontend,
         use_feat_batchnorm=params.use_feat_batchnorm,
     )
@@ -872,10 +855,16 @@ def main():
     args.return_cuts = True
     librispeech = LibriSpeechAsrDataModule(args)
 
-    # Get all test dataloaders (LibriSpeech + CHiME-4)
-    all_test_dls = librispeech.all_test_dataloaders()
+    test_clean_cuts = librispeech.test_clean_cuts()
+    test_other_cuts = librispeech.test_other_cuts()
 
-    for test_set_name, test_dl in all_test_dls.items():
+    test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
+    test_other_dl = librispeech.test_dataloaders(test_other_cuts)
+
+    test_sets = ["test-other", "test-clean"]
+    test_dl = [test_clean_dl, test_other_dl]
+
+    for test_set, test_dl in zip(test_sets, test_dl):
         results_dict = decode_dataset(
             dl=test_dl,
             params=params,
@@ -890,7 +879,7 @@ def main():
             eos_id=eos_id,
         )
 
-        save_results(params=params, test_set_name=test_set_name, results_dict=results_dict)
+        save_results(params=params, test_set_name=test_set, results_dict=results_dict)
 
     logging.info("Done!")
 

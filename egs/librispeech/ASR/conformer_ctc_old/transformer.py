@@ -185,9 +185,9 @@ class Transformer(nn.Module):
             x = x.permute(0, 2, 1)  # (N, C, T) -> (N, T, C)
         if isinstance(self.use_feat_batchnorm, float):
             x *= self.use_feat_batchnorm
-        encoder_memory, memory_key_padding_mask, layer_results, att_maps = self.run_encoder(x, supervision)
+        encoder_memory, memory_key_padding_mask = self.run_encoder(x, supervision)
         x = self.ctc_output(encoder_memory)
-        return x, encoder_memory, memory_key_padding_mask, layer_results, att_maps
+        return x, encoder_memory, memory_key_padding_mask
 
     def run_encoder(
         self, x: torch.Tensor, supervisions: Optional[Supervisions] = None

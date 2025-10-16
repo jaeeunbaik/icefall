@@ -1,3 +1,6 @@
 log-*
 .DS_Store
 run*.sh
+exp*/
+e.dataset.sampling.cut_samplers import SimpleCutSampler
+*.log

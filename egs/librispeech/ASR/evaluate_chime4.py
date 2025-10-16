@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Dict, List
 
 import torch
-from conformer_ctc.asr_datamodule import LibriSpeechAsrDataModule
-from conformer_ctc.conformer import Conformer
+from conformer_ctc_old.asr_datamodule import LibriSpeechAsrDataModule
+from conformer_ctc_old.conformer import Conformer
 
 
 def setup_logging(args):
@@ -63,7 +63,7 @@ def load_model(checkpoint_path: Path, device: torch.device):
 
 def evaluate_chime4(model, datamodule, device: torch.device):
     """Evaluate model on CHiME-4 test sets."""
-    from conformer_ctc.decode import greedy_search
+    from conformer_ctc_old.decode import greedy_search
     
     # Get CHiME-4 test dataloaders
     test_loaders = datamodule.chime4_test_dataloaders()

@@ -16,7 +16,6 @@
 # limitations under the License.
 
 import math
-import logging
 import warnings
 from typing import Optional, Tuple, Union
 
@@ -50,12 +49,12 @@ class Conformer(Transformer):
         d_model: int = 256,
         nhead: int = 4,
         dim_feedforward: int = 2048,
-        num_encoder_layers: int = 18,
-        num_decoder_layers: int = 0,
+        num_encoder_layers: int = 16,
+        num_decoder_layers: int = 6,
         dropout: float = 0.1,
         cnn_module_kernel: int = 31,
         normalize_before: bool = True,
-        vgg_frontend: bool = False,
+        vgg_frontend: bool = True,
         use_feat_batchnorm: Union[float, bool] = 0.1,
     ) -> None:
         super(Conformer, self).__init__(
@@ -122,15 +121,12 @@ class Conformer(Transformer):
         mask = encoder_padding_mask(x.size(0), supervisions)
         if mask is not None:
             mask = mask.to(x.device)
-            
-        layer_results = None
-        att_maps = None
-        x, layer_results, att_maps = self.encoder(x, pos_emb, src_key_padding_mask=mask)  # (T, B, F)
+        x = self.encoder(x, pos_emb, src_key_padding_mask=mask)  # (T, B, F)
 
         if self.normalize_before:
             x = self.after_norm(x)
 
-        return x, mask, layer_results, att_maps
+        return x, mask
 
 
 class ConformerEncoderLayer(nn.Module):
@@ -233,15 +229,15 @@ class ConformerEncoderLayer(nn.Module):
         residual = src
         if self.normalize_before:
             src = self.norm_mha(src)
-        attn_output, att_maps = self.self_attn(
+        src_att = self.self_attn(
             src,
             src,
             src,
             pos_emb=pos_emb,
             attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask,
-        )
-        src = residual + self.dropout(attn_output)
+        )[0]
+        src = residual + self.dropout(src_att)
         if not self.normalize_before:
             src = self.norm_mha(src)
 
@@ -266,7 +262,7 @@ class ConformerEncoderLayer(nn.Module):
         if self.normalize_before:
             src = self.norm_final(src)
 
-        return src, att_maps
+        return src
 
 
 class ConformerEncoder(nn.TransformerEncoder):
@@ -316,22 +312,19 @@ class ConformerEncoder(nn.TransformerEncoder):
 
         """
         output = src
-        layer_outputs = []
-        attention_maps = []
+
         for mod in self.layers:
-            output, att_map = mod(
+            output = mod(
                 output,
                 pos_emb,
                 src_mask=mask,
                 src_key_padding_mask=src_key_padding_mask,
             )
-            layer_outputs.append(output)
-            attention_maps.append(att_map)
 
         if self.norm is not None:
             output = self.norm(output)
 
-        return output, layer_outputs, attention_maps
+        return output
 
 
 class RelPositionalEncoding(torch.nn.Module):
@@ -915,231 +908,3 @@ class Swish(torch.nn.Module):
 
 def identity(x):
     return x
-
-
-def compute_distillation_loss(
-    teacher_knowledge,
-    student_knowledge,
-    knowledge_lens,
-    loss_type: str = "mse",
-    knowledge_type: str = "encoder-output",
-    temperature: float = 1.0,
-):
-    """
-    Compute distillation loss between teacher and student knowledge.
-    
-    Args:
-        teacher_knowledge: Teacher model outputs (list of tensors for layers or single tensor)
-        student_knowledge: Student model outputs (list of tensors for layers or single tensor)
-        knowledge_lens: Length of valid frames for masking padding
-        loss_type: Type of loss ("mse", "cos", "kl")
-        knowledge_type: Type of knowledge ("encoder-output", "attention-map")
-        temperature: Temperature for softmax (used with KL divergence)
-    
-    Returns:
-        Distillation loss tensor
-    """
-    device = teacher_knowledge.device if hasattr(teacher_knowledge, 'device') else teacher_knowledge[0].device
-    
-    if knowledge_type == "encoder-output":
-        # For encoder outputs: teacher_knowledge and student_knowledge are tensors
-        # Shape: (T, B, D) for sequence length T, batch B, dimension D
-        teacher_out = teacher_knowledge
-        student_out = student_knowledge
-        
-        # Create mask for valid frames (remove padding)
-        if knowledge_lens is not None:
-            seq_len, batch_size = teacher_out.size(0), teacher_out.size(1)
-            mask = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
-            for i, length in enumerate(knowledge_lens):
-                if isinstance(length, torch.Tensor):
-                    length = length.item()
-                mask[i, :min(length, seq_len)] = True
-            mask = mask.transpose(0, 1)  # (T, B)
-        else:
-            mask = torch.ones(teacher_out.size(0), teacher_out.size(1), device=device, dtype=torch.bool)
-        
-        # Apply mask and compute loss
-        if loss_type == "mse":
-            loss = torch.nn.functional.mse_loss(student_out[mask], teacher_out[mask], reduction='mean')
-        elif loss_type == "cos":
-            # Cosine similarity loss: 1 - cosine_similarity
-            teacher_flat = teacher_out[mask]  # (valid_frames, D)
-            student_flat = student_out[mask]  # (valid_frames, D)
-            cos_sim = torch.nn.functional.cosine_similarity(teacher_flat, student_flat, dim=-1)
-            loss = 1.0 - cos_sim.mean()
-        elif loss_type == "kl":
-            # For encoder outputs, apply softmax and compute KL divergence
-            # KL(P||Q) = sum(P * log(P/Q)) where P=teacher, Q=student
-            teacher_prob = torch.nn.functional.softmax(teacher_out / temperature, dim=-1)
-            student_log_prob = torch.nn.functional.log_softmax(student_out / temperature, dim=-1)
-            # kl_div expects log_probabilities as input and probabilities as target
-            loss = torch.nn.functional.kl_div(student_log_prob[mask], teacher_prob[mask], reduction='batchmean')
-            
-            # Debug logging for KL divergence
-            if torch.rand(1).item() < 0.001:  # Log 0.1% of the time to avoid spam
-                logging.debug(f"Encoder KL divergence debug - loss before clamp: {loss.item():.6f}, "
-                             f"teacher_prob range: [{teacher_prob[mask].min():.6f}, {teacher_prob[mask].max():.6f}], "
-                             f"student_log_prob range: [{student_log_prob[mask].min():.6f}, {student_log_prob[mask].max():.6f}]")
-            
-            # Ensure KL divergence is non-negative (should always be >= 0 by definition)
-            if loss < 0:
-                # For very small negative values due to numerical precision, set to small positive value
-                if loss > -1e-5:
-                    loss = torch.tensor(1e-8, device=loss.device, requires_grad=True)
-                    if torch.rand(1).item() < 0.01:  # Log 1% of cases
-                        logging.debug(f"Small negative encoder KL divergence ({loss.item():.8f}) clamped to 1e-8")
-                else:
-                    logging.warning(f"Large negative encoder KL divergence detected: {loss.item():.6f}, clamping to 0")
-                    loss = torch.clamp(loss, min=0.0)
-        else:
-            raise ValueError(f"Unsupported loss_type: {loss_type}")
-            
-    elif knowledge_type == "attention-map":
-        # For attention maps: teacher_knowledge and student_knowledge are tensors
-        # Shape: (B, T, T) for batch B, sequence length T
-        teacher_attn = teacher_knowledge
-        student_attn = student_knowledge
-        
-        # Create mask for valid attention positions
-        if knowledge_lens is not None:
-            batch_size, seq_len = teacher_attn.size(0), teacher_attn.size(1)
-            mask = torch.zeros(batch_size, seq_len, seq_len, device=device, dtype=torch.bool)
-            for i, length in enumerate(knowledge_lens):
-                if isinstance(length, torch.Tensor):
-                    length = length.item()
-                valid_len = min(length, seq_len)
-                mask[i, :valid_len, :valid_len] = True
-        else:
-            mask = torch.ones_like(teacher_attn, dtype=torch.bool)
-        
-        # Apply mask and compute loss
-        if loss_type == "kl":
-            # For attention maps, they are already softmax probabilities
-            # So we need to be careful about applying additional softmax
-            if temperature != 1.0:
-                # Apply temperature scaling only if temperature is not 1.0
-                teacher_prob = torch.nn.functional.softmax(teacher_attn / temperature, dim=-1)
-                student_log_prob = torch.nn.functional.log_softmax(student_attn / temperature, dim=-1)
-            else:
-                # Use attention maps directly (they are already probabilities)
-                teacher_prob = teacher_attn
-                # Convert to log probabilities for KL divergence
-                student_log_prob = torch.log(student_attn + 1e-8)  # Add small epsilon to avoid log(0)
-            
-            # Ensure probabilities are valid (sum to 1 along last dimension)
-            teacher_prob = teacher_prob / (teacher_prob.sum(dim=-1, keepdim=True) + 1e-8)
-            
-            loss = torch.nn.functional.kl_div(student_log_prob[mask], teacher_prob[mask], reduction='batchmean')
-            
-            # Debug logging for KL divergence
-            if torch.rand(1).item() < 0.001:  # Log 0.1% of the time to avoid spam
-                logging.debug(f"Attention KL divergence debug - loss before clamp: {loss.item():.6f}, "
-                             f"teacher_prob range: [{teacher_prob[mask].min():.6f}, {teacher_prob[mask].max():.6f}], "
-                             f"student_log_prob range: [{student_log_prob[mask].min():.6f}, {student_log_prob[mask].max():.6f}], "
-                             f"teacher_prob sum: {teacher_prob[mask][:100].sum(-1).mean():.6f}")
-            
-            # Ensure KL divergence is non-negative (should always be >= 0 by definition)
-            if loss < 0:
-                # For very small negative values due to numerical precision, clamp to a small positive value
-                if loss > -1e-5:
-                    loss = torch.tensor(1e-8, device=loss.device, requires_grad=True)
-                    if torch.rand(1).item() < 0.01:  # Log 1% of cases
-                        logging.debug(f"Small negative attention KL divergence ({loss.item():.8f}) clamped to 1e-8")
-                else:
-                    logging.warning(f"Large negative attention KL divergence detected: {loss.item():.6f}, clamping to 0")
-                    loss = torch.clamp(loss, min=0.0)
-        elif loss_type == "mse":
-            # Direct MSE on attention weights
-            loss = torch.nn.functional.mse_loss(student_attn[mask], teacher_attn[mask], reduction='mean')
-        elif loss_type == "cos":
-            # Cosine similarity on flattened attention maps
-            teacher_flat = teacher_attn[mask]
-            student_flat = student_attn[mask]
-            cos_sim = torch.nn.functional.cosine_similarity(teacher_flat, student_flat, dim=0)
-            loss = 1.0 - cos_sim
-        else:
-            raise ValueError(f"Unsupported loss_type: {loss_type}")
-    else:
-        raise ValueError(f"Unsupported knowledge_type: {knowledge_type}")
-    
-    return loss
-
-
-def compute_multi_layer_distillation_loss(
-    teacher_knowledge,
-    student_knowledge,
-    knowledge_lens,
-    layer_indices,
-    loss_type: str = "mse",
-    knowledge_type: str = "encoder-output",
-    aggregation: str = "layer_avg",
-    temperature: float = 1.0,
-):
-    """
-    Compute multi-layer distillation loss between teacher and student knowledge.
-    
-    Args:
-        teacher_knowledge: List of teacher model outputs for each layer
-        student_knowledge: List of student model outputs for each layer  
-        knowledge_lens: Length of valid frames for masking padding
-        layer_indices: List of layer indices to use for distillation
-        loss_type: Type of loss ("mse", "cos", "kl")
-        knowledge_type: Type of knowledge ("encoder-output", "attention-map")
-        aggregation: How to aggregate losses ("layer_avg", "output_avg")
-        temperature: Temperature for softmax (used with KL divergence)
-    
-    Returns:
-        Aggregated distillation loss tensor
-    """
-    device = teacher_knowledge[0].device
-    
-    if aggregation == "layer_avg":
-        # Average the layer outputs first, then compute a single loss
-        if knowledge_type == "encoder-output":
-            # teacher_knowledge and student_knowledge are lists of tensors
-            # Each tensor shape: (T, B, D)
-            teacher_avg = torch.stack([teacher_knowledge[i] for i in layer_indices], dim=0).mean(dim=0)
-            student_avg = torch.stack([student_knowledge[i] for i in layer_indices], dim=0).mean(dim=0)
-        elif knowledge_type == "attention-map":
-            # Each tensor shape: (B, T, T)
-            teacher_avg = torch.stack([teacher_knowledge[i] for i in layer_indices], dim=0).mean(dim=0)
-            student_avg = torch.stack([student_knowledge[i] for i in layer_indices], dim=0).mean(dim=0)
-        else:
-            raise ValueError(f"Unsupported knowledge_type: {knowledge_type}")
-        
-        # Compute single loss on averaged outputs
-        loss = compute_distillation_loss(
-            teacher_knowledge=teacher_avg,
-            student_knowledge=student_avg,
-            knowledge_lens=knowledge_lens,
-            loss_type=loss_type,
-            knowledge_type=knowledge_type,
-            temperature=temperature,
-        )
-        
-    elif aggregation == "output_avg":
-        # Compute loss for each layer and average them
-        losses = []
-        for layer_idx in layer_indices:
-            if layer_idx >= len(teacher_knowledge) or layer_idx >= len(student_knowledge):
-                continue  # Skip invalid layer indices
-            
-            layer_loss = compute_distillation_loss(
-                teacher_knowledge=teacher_knowledge[layer_idx],
-                student_knowledge=student_knowledge[layer_idx],
-                knowledge_lens=knowledge_lens,
-                loss_type=loss_type,
-                knowledge_type=knowledge_type,
-                temperature=temperature,
-            )
-            losses.append(layer_loss)
-        
-        if losses:
-            loss = torch.stack(losses).mean()
-        else:
-            loss = torch.tensor(0.0, device=device, requires_grad=True)
-    else:
-        raise ValueError(f"Unsupported aggregation: {aggregation}")
-    
-    return loss

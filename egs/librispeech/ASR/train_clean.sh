@@ -1,54 +1,41 @@
-#!/bin/bash
-
-# train.sh - LibriSpeech ASR Training Script with Data Augmentation Control
-# Usage: bash train.sh
+#!/bin/# Data Augmentation Controls (modify these as needed)
 
 set -euo pipefail
 
-# Data Augmentation Controls (modify these as needed)
-enable_spec_aug=false          # SpecAugment (frequency/time masking)
-enable_musan=false             # MUSAN noise augmentation
-enable_rir=false         
-enable_cutmix=false 
-enable_concatenate=false   
-
-# RIR settings (used when enable_rir=true)
-rir_cuts_path="data/rir/rir_cuts.jsonl.gz"  
-rir_prob=0.5                
-
 # Training parameters
-world_size=3 
-max_duration=300  
-valid_max_duration=15         
-num_buckets=200               
-num_workers=32    
-warm_step=10000
-lang_dir="./data/lang_bpe_5000"
+world_size=3                    # Multi-GPU restored since test passed
+max_duration=400                # 4x increase for GPU memory utilization (100->400)
+valid_max_duration=70          # 4x increase to match (15->60)
+num_buckets=400                 # 2x increase for better bucketing with larger batches
+num_workers=24                  # Keep same for stability
+lang_dir="./data/lang_bpe_1024"
+exp_dir="conformer_ctc/exp_clean70000"    # Ultra slow warmup experiment
 method="ctc-decoding"
+warm_step=70000               
+lr_factor=5.0                  # Even smaller learning rate factor
+weight_decay=1e-6              # Stronger regularization
 
 # Model parameters
 att_rate=0                    # 0 for pure CTC, >0 for CTC+Attention
 num_decoder_layers=0          # 0 for pure CTC
 
+# Augmentation
+enable_spec_aug=False
+enable_musan=False
+
 # Other settings
-start_epoch=78
-master_port=12346
+start_epoch=0
+master_port=12345
 sanity_check=false           # Set to true for OOM checking (slower)
 
-# Validation settings
-enable_validation=true       # Temporarily disable validation to avoid crashes
-valid_interval=5000           # Much larger interval if we enable validation later
+# Validation settings - more frequent validation to catch improvements early
+valid_interval=5000           # More frequent validation to catch improvements
 
 # Validation decoding settings
 validation_decoding_method="greedy"    # "greedy" or "beam" - use greedy for faster validation
-validation_search_beam=10.0            # Beam size for validation (only used if method="beam")
-validation_output_beam=5.0             # Output beam for validation (only used if method="beam")
+validation_search_beam=20.0            # Beam size for validation (only used if method="beam")
+validation_output_beam=8.0             # Output beam for validation (only used if method="beam")
 validation_skip_wer=false              # Skip WER computation for even faster validation (디버깅용 - 이제 false로 변경)
-
-if [ "$enable_rir" = "true" ]; then
-    echo "  - RIR Path: $rir_cuts_path"
-    echo "  - RIR Probability: $rir_prob"
-fi
 
 
 # gdb --args python ./conformer_ctc/train.py
@@ -58,33 +45,28 @@ else
     export PYTHONPATH="${PYTHONPATH}:/tmp/icefall"
 fi
 
-python3 ./conformer_ctc/train.py \
+
+CUDA_VISIBLE_DEVICES=1,2,3 python3 ./conformer_ctc/train.py \
     --master-port $master_port \
-    --sanity-check $sanity_check \
     --world-size $world_size \
     --warm-step $warm_step \
+    --lr-factor $lr_factor \
+    --weight-decay $weight_decay \
+    --enable-spec-aug $enable_spec_aug \
+    --enable-musan $enable_musan \
     --start-epoch $start_epoch \
     --att-rate $att_rate \
     --num-decoder-layers $num_decoder_layers \
     --num-workers $num_workers \
-    --enable-spec-aug $enable_spec_aug \
-    --enable-musan $enable_musan \
-    --enable-rir $enable_rir \
-    --rir-cuts-path $rir_cuts_path \
-    --rir-prob $rir_prob \
+    --on-the-fly-feats true \
     --max-duration $max_duration \
     --valid-max-duration $valid_max_duration \
     --num-buckets $num_buckets \
     --bucketing-sampler true \
-    --concatenate-cuts $enable_concatenate \
     --duration-factor 1.0 \
     --drop-last true \
     --shuffle true \
     --lang-dir $lang_dir \
-    --method $method \
-    --enable-validation $enable_validation \
-    --valid-interval $valid_interval \
-    --validation-decoding-method $validation_decoding_method \
-    --validation-search-beam $validation_search_beam \
-    --validation-output-beam $validation_output_beam \
-    --validation-skip-wer $validation_skip_wer
+    --exp-dir $exp_dir \
+    --debug-train false \
+    --debug-first-n-batches 5

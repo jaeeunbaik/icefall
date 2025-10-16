@@ -5,27 +5,27 @@ set -euo pipefail
 # Training parameters
 world_size=4                    # Multi-GPU restored since test passed
 max_duration=300                # 4x increase for GPU memory utilization (100->400)
-valid_max_duration=40          # 4x increase to match (15->60)
+valid_max_duration=60          # 4x increase to match (15->60)
 num_buckets=300                 # 2x increase for better bucketing with larger batches
 num_workers=8                  # Keep same for stability
 lang_dir="./data/lang_bpe_1024"
-exp_dir="conformer_ctc/exp_12000"    # Ultra slow warmup experiment
+exp_dir="conformer_ctc/exp_hybrid_30000"    # Hybrid experiment
 method="ctc-decoding"
-warm_step=12000               
+warm_step=30000               
 lr_factor=5.0                  # Even smaller learning rate factor
 weight_decay=1e-6              # Stronger regularization
 
-# Model parameters
-att_rate=0                    # 0 for pure CTC, >0 for CTC+Attention
-num_decoder_layers=0          # 0 for pure CTC
+# Model parameters - HYBRID CONFIGURATION
+att_rate=0.8                  # 30% Attention + 70% CTC for balanced hybrid training
+num_decoder_layers=6          # 6 transformer decoder layers for hybrid mode
 
 # Augmentation
-enable_spec_aug=False
-enable_musan=False
+enable_spec_aug=True
+enable_musan=True
 
 # Other settings
-start_epoch=0
-master_port=12345
+start_epoch=0                 # Start from scratch for hybrid training
+master_port=12346             # Different port to avoid conflicts
 sanity_check=false           # Set to true for OOM checking (slower)
 
 # Validation settings - more frequent validation to catch improvements early

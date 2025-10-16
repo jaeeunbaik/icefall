@@ -33,8 +33,6 @@ import logging
 from pathlib import Path
 from shutil import copyfile
 from typing import Optional, Tuple
-import random
-import numpy as np
 
 import k2
 import torch
@@ -43,7 +41,6 @@ import torch.nn as nn
 import sentencepiece as spm
 from asr_datamodule import LibriSpeechAsrDataModule
 from conformer import Conformer
-from ema_teacher import EMATeacher
 from lhotse.cut import Cut
 from lhotse.utils import fix_random_seed
 from torch import Tensor
@@ -70,17 +67,15 @@ from icefall.utils import (
     str2bool,
 )
 
+# Global counter for validation samples to control terminal logging frequency
+_VALIDATION_SAMPLE_COUNTER = 0
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument(
-        "--resume-from",
-        type=str,
-        default=None,
-        help="Path to a checkpoint .pt file to resume training from. If set, overrides --start-epoch.",
-    )
+
     parser.add_argument(
         "--world-size",
         type=int,
@@ -105,7 +100,7 @@ def get_parser():
     parser.add_argument(
         "--num-epochs",
         type=int,
-        default=10,
+        default=100,
         help="Number of epochs to train.",
     )
 
@@ -122,7 +117,7 @@ def get_parser():
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="./conformer_ctc_sd/exp",
+        default="./conformer_ctc/exp",
         help="""The experiment dir.
         It specifies the directory where all training related
         files, e.g., checkpoints, log, etc, are saved
@@ -182,46 +177,6 @@ def get_parser():
         "Recommended: 30000 (with data aug), 15000-20000 (without data aug)",
     )
 
-    # Fine-tuning scheduler options
-    parser.add_argument(
-        "--scheduler-type",
-        type=str,
-        default="noam",
-        choices=["noam", "plateau", "constant"],
-        help="Type of learning rate scheduler. "
-        "noam: Noam scheduler (default), "
-        "plateau: ReduceLROnPlateau, "
-        "constant: Fixed learning rate",
-    )
-    
-    parser.add_argument(
-        "--base-lr",
-        type=float,
-        default=2e-5,
-        help="Base learning rate for plateau and constant schedulers",
-    )
-    
-    parser.add_argument(
-        "--scheduler-patience",
-        type=int,
-        default=3,
-        help="Patience for ReduceLROnPlateau scheduler",
-    )
-    
-    parser.add_argument(
-        "--scheduler-factor",
-        type=float,
-        default=0.5,
-        help="Factor for ReduceLROnPlateau scheduler",
-    )
-    
-    parser.add_argument(
-        "--min-lr",
-        type=float,
-        default=1e-6,
-        help="Minimum learning rate for ReduceLROnPlateau scheduler",
-    )
-
     parser.add_argument(
         "--seed",
         type=int,
@@ -233,85 +188,6 @@ def get_parser():
         type=str2bool,
         default=True,
         help="About Sanity check process",
-    )
-    
-    # Self-distillation arguments
-    parser.add_argument(
-        "--enable-self-distillation",
-        type=str2bool,
-        default=True,
-        help="Enable self-distillation training between clean and noisy samples",
-    )
-    
-    parser.add_argument(
-        "--distill-layers",
-        type=str,
-        default="6",
-        help="Which encoder layer(s) to use for distillation (0-based). "
-             "Can be a single layer (e.g., '6') or comma-separated list (e.g., '4,6,8'). "
-             "Clean and noisy outputs from these layers will be compared.",
-    )
-    
-    parser.add_argument(
-        "--distill-loss-type",
-        type=str,
-        default="mse",
-        choices=["mse", "cos", "kl"],
-        help="Type of loss for self-distillation: 'mse' for Mean Squared Error, "
-             "'cosine' for cosine similarity loss.",
-    )
-    
-    parser.add_argument(
-        "--alpha",
-        type=float,
-        default=0.7,
-        help="Weight for self-distillation loss. Total loss = ctc_loss + distill_weight * distill_loss",
-    )
-    
-    parser.add_argument(
-        "--distill-aggregation",
-        type=str,
-        default="layer_avg",
-        choices=["layer_avg", "output_avg"],
-        help="How to aggregate multi-layer distillation losses: "
-             "'layer_avg' averages the layer outputs first then computes a single loss, "
-             "'output_avg' computes loss for each layer and averages them.",
-    )
-    
-    parser.add_argument(
-        "--knowledge",
-        type=str,
-        default="encoder-output",
-        choices=["encoder-output", "attention-map"],
-        help="Type of knowledge to use for self-distillation: "
-             "'encoder-output' uses intermediate encoder layer outputs, "
-             "'attention-map' uses attention weights from self-attention layers.",
-    )
-    
-    parser.add_argument(
-        "--distill-temperature",
-        type=float,
-        default=1.0,
-        help="Temperature for attention map distillation (used with KL divergence). "
-             "Higher values make attention distributions smoother.",
-    )
-    
-    # EMA Teacher Model Arguments
-    parser.add_argument(
-        "--ema-decay",
-        type=float,
-        default=0.999,
-        help="EMA decay rate for teacher model updates. "
-             "Higher values (closer to 1.0) make teacher model change more slowly. "
-             "Typical values: 0.999, 0.9999",
-    )
-    
-    parser.add_argument(
-        "--ema-start-step",
-        type=int,
-        default=1000,
-        help="Step number to start EMA teacher model updates. "
-             "Before this step, teacher model equals student model.",
     )
     
     parser.add_argument(
@@ -452,9 +328,9 @@ def get_params() -> AttributeDict:
             "attention_dim": 256,
             "nhead": 4,
             # parameters for loss
-            "beam_size": 4,  # Reduced from 10 to 4 for numerical stability
+            "beam_size": 10,
             "reduction": "sum",
-            "use_double_scores": False,  # Changed to False for stability
+            "use_double_scores": True,
             # parameters for decoding/validation
             "search_beam": 20.0,
             "output_beam": 8.0,
@@ -463,7 +339,7 @@ def get_params() -> AttributeDict:
             # parameters for Noam
             "weight_decay": 1e-6,
             "warm_step": 30000,
-            "env_info": get_env_info()
+            "env_info": get_env_info(),
         }
     )
 
@@ -475,8 +351,7 @@ def load_checkpoint_if_available(
     model: nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-    ema_teacher: Optional[EMATeacher] = None,
-) -> Optional[dict]:
+) -> None:
     """Load checkpoint from file.
 
     If params.start_epoch is positive, it will load the checkpoint from
@@ -498,77 +373,37 @@ def load_checkpoint_if_available(
     Returns:
       Return None.
     """
+    if params.start_epoch <= 0:
+        return
 
-    # Define models_dir consistently at the beginning
+    # First try to find checkpoint in models directory
     models_dir = params.exp_dir / "models"
-
-    # If resume-from is set, use that path directly
-    resume_path = getattr(params, "resume_from", None)
-    if resume_path:
-        filename = Path(resume_path)
-        if not filename.exists():
-            logging.warning(f"Resume checkpoint not found at {filename}")
-            return None
-    else:
-        if params.start_epoch <= 0:
-            return None
-        # First try to find checkpoint in models directory
-        filename = models_dir / f"epoch-{params.start_epoch-1}.pt"
-        # If not found in models directory, try the old location for backward compatibility
-        if not filename.exists():
-            filename = params.exp_dir / f"epoch-{params.start_epoch-1}.pt"
-        if not filename.exists():
-            logging.warning(f"Checkpoint not found at {filename}")
-            return None
+    filename = models_dir / f"epoch-{params.start_epoch-1}.pt"
+    
+    # If not found in models directory, try the old location for backward compatibility
+    if not filename.exists():
+        filename = params.exp_dir / f"epoch-{params.start_epoch-1}.pt"
+    
+    if not filename.exists():
+        logging.warning(f"Checkpoint not found at {filename}")
+        return
     
     saved_params = load_checkpoint(
         filename,
         model=model,
-        optimizer=None,  # Don't load optimizer here, we'll handle it separately
+        optimizer=optimizer,
         scheduler=scheduler,
     )
 
     keys = [
         "best_train_epoch",
-        "best_valid_epoch", 
+        "best_valid_epoch",
         "batch_idx_train",
         "best_train_loss",
         "best_valid_loss",
     ]
     for k in keys:
         params[k] = saved_params[k]
-
-    # Load the full checkpoint data including optimizer state
-    full_checkpoint = torch.load(filename, map_location='cpu')
-    
-    # Add optimizer state to saved_params if it exists
-    if 'optimizer' in full_checkpoint:
-        saved_params['optimizer'] = full_checkpoint['optimizer']
-
-    # Try to load EMA teacher checkpoint if it exists
-    if ema_teacher is not None:
-        if resume_path:
-            # If resume_path was used, try to find EMA checkpoint next to it
-            resume_file = Path(resume_path)
-            ema_filename = resume_file.parent / f"{resume_file.stem}-ema-teacher.pt"
-        else:
-            # Standard epoch-based EMA checkpoint naming
-            ema_filename = models_dir / f"epoch-{params.start_epoch-1}-ema-teacher.pt"
-        
-        # If not found, try old location for backward compatibility
-        if not ema_filename.exists():
-            ema_filename = params.exp_dir / f"epoch-{params.start_epoch-1}-ema-teacher.pt"
-        
-        if ema_filename.exists():
-            try:
-                ema_state_dict = torch.load(ema_filename, map_location='cpu')
-                ema_teacher.load_state_dict(ema_state_dict)
-                logging.info(f"Loaded EMA teacher checkpoint from {ema_filename}")
-                saved_params['ema_teacher'] = ema_state_dict
-            except Exception as e:
-                logging.warning(f"Failed to load EMA teacher checkpoint: {e}")
-        else:
-            logging.info("EMA teacher checkpoint not found, will initialize from student model")
 
     return saved_params
 
@@ -582,8 +417,6 @@ def save_checkpoint(
     suffix: str = "",
     wer_value: Optional[float] = None,
     step: Optional[int] = None,
-    ema_teacher: Optional[EMATeacher] = None,
-    epoch: Optional[int] = None,
 ) -> None:
     """Save model, optimizer, scheduler and training stats to file.
 
@@ -608,13 +441,11 @@ def save_checkpoint(
         # Use step instead of epoch for validation checkpoints
         epoch_or_step = step if step is not None else params.cur_epoch
         if wer_value is not None:
-            filename = models_dir / f"step-{epoch_or_step}-{suffix}-wer{wer_value:.2f}-epoch{epoch}.pt"
+            filename = models_dir / f"step-{epoch_or_step}-{suffix}-wer{wer_value:.2f}.pt"
         else:
             filename = models_dir / f"step-{epoch_or_step}-{suffix}.pt"
     else:
         filename = models_dir / f"epoch-{params.cur_epoch}.pt"
-    
-    # Save main checkpoint
     save_checkpoint_impl(
         filename=filename,
         model=model,
@@ -623,12 +454,6 @@ def save_checkpoint(
         scheduler=scheduler,
         rank=rank,
     )
-    
-    # Save EMA teacher model separately if it exists
-    if ema_teacher is not None:
-        ema_filename = models_dir / f"epoch-{params.cur_epoch}-ema-teacher.pt"
-        torch.save(ema_teacher.state_dict(), ema_filename)
-        logging.info(f"EMA teacher checkpoint saved to {ema_filename}")
 
     if params.best_train_epoch == params.cur_epoch:
         best_train_filename = models_dir / "best-train-loss.pt"
@@ -649,234 +474,41 @@ def compute_loss(
     batch: dict,
     graph_compiler: BpeCtcTrainingGraphCompiler,
     is_training: bool,
-    ema_teacher: Optional[EMATeacher] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
-    Compute CTC loss with optional self-distillation.
+    Compute CTC loss given the model and its inputs.
 
     Args:
       params:
         Parameters for training. See :func:`get_params`.
       model:
-        The model for training. It is an instance of ConformerCTC.
+        The model for training. It is an instance of Conformer in our case.
       batch:
-        A batch of data. Can contain both clean and noisy samples for self-distillation.
+        A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
+        for the content in it.
       graph_compiler:
         It is used to build a decoding graph from a ctc topo and training
-        transcript.
+        transcript. The training transcript is contained in the given `batch`,
+        while the ctc topo is built when this compiler is instantiated.
       is_training:
-        True for training. False for validation.
+        True for training. False for validation. When it is True, this
+        function enables autograd during computation; when it is False, it
+        disables autograd.
     """
     device = graph_compiler.device
-    
-    # Handle clean-noisy batch structure for self-distillation
-    if 'clean' in batch and 'noisy' in batch and params.enable_self_distillation:
-        # Self-distillation mode with clean-noisy samples
-        clean_feature = batch['clean']['inputs']
-        noisy_feature = batch['noisy']['inputs']
-        clean_supervisions = batch['clean']['supervisions']
-        noisy_supervisions = batch['noisy']['supervisions']
-        
-        # Use noisy samples as primary for CTC loss computation
-        feature = noisy_feature
-        supervisions = noisy_supervisions
-        
-        # Note: We'll move to the correct device later after getting model device
-        use_self_distillation = True
-        # Clean-noisy pairs are being used for self-distillation
-    else:
-        # Normal mode or self-distillation disabled
-        feature = batch["inputs"]
-        supervisions = batch["supervisions"]
-        # Note: We'll move to the correct device later after getting model device
-        
-        clean_feature = None
-        noisy_feature = None
-        clean_supervisions = None
-        use_self_distillation = False
-    
+    feature = batch["inputs"]
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
-    
-    # Ensure model and feature are on the same device
-    model_device = next(model.parameters()).device
-    
-    # Move feature to the correct device if needed
-    if feature.device != model_device:
-        feature = feature.to(model_device)
-    
-    # Also move clean_feature if it exists
-    if clean_feature is not None and clean_feature.device != model_device:
-        clean_feature = clean_feature.to(model_device)
-    t_output = None
+    feature = feature.to(device)
+
+    supervisions = batch["supervisions"]
     with torch.set_grad_enabled(is_training):
-        # Forward pass through model (noisy sample)
-        nnet_output, encoder_memory, memory_mask, hiddens, att_maps = model(feature, supervisions)
-        
-        # Get the original lengths from supervisions
-        if isinstance(supervisions, dict) and 'num_frames' in supervisions:
-            original_lengths = supervisions['num_frames']
-            if not isinstance(original_lengths, torch.Tensor):
-                original_lengths = torch.tensor(original_lengths, device=model_device)
-            # Apply subsampling factor to get actual output lengths
-            output_lens = (original_lengths + params.subsampling_factor - 1) // params.subsampling_factor
-            output_lens = output_lens.cpu().tolist()  # Convert to list for distillation functions
-        else:
-            # Fallback: use actual nnet_output sequence lengths for each sample
-            batch_size = nnet_output.size(1)  # N from (T, N, C)
-            seq_len = nnet_output.size(0)     # T from (T, N, C) 
-            output_lens = [seq_len] * batch_size
-        
-        # Self-distillation computation
-        distillation_loss = torch.tensor(0.0, device=model_device)
-        
-        if use_self_distillation and params.enable_self_distillation and clean_feature is not None:
-            # Log only occasionally to reduce spam
-            if params.batch_idx_train % 1000 == 0:
-                logging.info(f"Self-distillation active: ema_teacher={ema_teacher is not None}, step={params.batch_idx_train}")
-            
-            # Use EMA teacher model if available, otherwise use the same model with clean samples
-            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-                teacher_model = ema_teacher.get_teacher_model()
-                with torch.no_grad():
-                    t_output, _, _, t_hidden, t_maps = teacher_model(clean_feature, clean_supervisions)
-                if params.batch_idx_train % 1000 == 0:
-                    logging.info(f"Using EMA teacher model for distillation (step {params.batch_idx_train})")
-            else:
-                # 학습 초반부에 EMA 모델 없으면 student 모델로 계산
-                with torch.no_grad():
-                    t_output, _, _, t_hidden, t_maps = model(clean_feature, clean_supervisions)
-                if ema_teacher is not None and params.batch_idx_train % 1000 == 0:
-                    logging.info(f"EMA teacher exists but step {params.batch_idx_train} < start_step {params.ema_start_step}, using same model")
-                elif ema_teacher is None and params.batch_idx_train % 1000 == 0:
-                    logging.info(f"No EMA teacher, using same model with clean samples as teacher")
-            
-            # Parse distillation layers from comma-separated string
-            try:
-                distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
-            except:
-                distill_layers = [int(params.distill_layers)]
-            
-            if params.knowledge == "encoder-output":
-                # Extract encoder outputs for distillation
-                if hiddens is not None and t_hidden is not None:
-                    
-                    # Import the multi-layer distillation function
-                    from conformer import compute_multi_layer_distillation_loss
-                    
-                    if len(distill_layers) == 1:
-                        from conformer import compute_distillation_loss
-                        distillation_loss = compute_distillation_loss(
-                            teacher_knowledge=t_output,
-                            student_knowledge=nnet_output,
-                            knowledge_lens=output_lens,
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                        )
-                    else:
-                        from conformer import compute_multi_layer_distillation_loss
-                        distillation_loss = compute_multi_layer_distillation_loss(
-                            teacher_knowledge=t_hidden,
-                            student_knowledge=hiddens,
-                            knowledge_lens=output_lens,
-                            layer_indices=distill_layers,
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                            aggregation=params.distill_aggregation,
-                        )
-                    
-            elif params.knowledge == "attention-map":
-                # Extract attention maps for distillation
-                if att_maps is not None and t_maps is not None:
-                    
-                    # Import the multi-layer distillation function
-                    from conformer import compute_multi_layer_distillation_loss
-                    
-                    distillation_loss = compute_multi_layer_distillation_loss(
-                        teacher_knowledge=t_maps,
-                        student_knowledge=att_maps,
-                        knowledge_lens=output_lens,
-                        layer_indices=distill_layers,
-                        loss_type="kl",  # Always use KL divergence for attention maps
-                        knowledge_type="attention-map",
-                        aggregation=params.distill_aggregation,
-                        temperature=params.distill_temperature,
-                    )
-                    logging.debug(f"Attention-map distillation loss computed: {distillation_loss.item():.6f}")
-                else:
-                    logging.warning("Attention maps not found in model output. Distillation disabled for this batch.")
-                    distillation_loss = torch.tensor(0.0, device=model_device)
-        else:
-            if not use_self_distillation:
-                logging.debug("Self-distillation disabled (use_self_distillation=False)")
-            elif clean_feature is None:
-                logging.warning("Clean feature is None, skipping self-distillation")
+        nnet_output, encoder_memory, memory_mask = model(feature, supervisions)
+        # nnet_output is (N, T, C)
 
     # NOTE: We need `encode_supervisions` to sort sequences with
     # different duration in decreasing order, required by
     # `k2.intersect_dense` called in `k2.ctc_loss`
-    s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
-    if t_output is not None:
-        t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
-        ctc_loss = 0.1 * t_ctc_loss + 0.9 * s_ctc_loss
-    else:
-        ctc_loss = s_ctc_loss
-
-
-
-    # Attention loss computation (if applicable)
-    if params.att_rate != 0.0:
-        with torch.set_grad_enabled(is_training):
-            mmodel = model.module if hasattr(model, "module") else model
-            # Note: We need to generate an unsorted version of token_ids
-            unsorted_token_ids = graph_compiler.texts_to_ids(supervisions["text"])
-            att_loss = mmodel.decoder_forward(
-                encoder_memory,
-                memory_mask,
-                token_ids=unsorted_token_ids,
-                sos_id=graph_compiler.sos_id,
-                eos_id=graph_compiler.eos_id,
-            )
-        total_loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
-    else:
-        att_loss = torch.tensor([0])
-        total_loss = ctc_loss
-
-    # Add self-distillation loss with proper scale matching
-    if use_self_distillation and distillation_loss.item() > 0:
-        # With reduction='mean', CTC loss scale is more manageable
-        total_loss = total_loss + params.alpha * distillation_loss
-        logging.debug(f"Loss combination: ctc_loss={total_loss-params.alpha*distillation_loss:.4f}, "
-                     f"distill_loss={distillation_loss:.4f}, alpha={params.alpha}, "
-                     f"total_loss={total_loss:.4f}")
-
-    assert total_loss.requires_grad == is_training
-
-    # Metrics tracking
-    info = MetricsTracker()
-    info["frames"] = supervision_segments[:, 2].sum().item()
-    info["ctc_loss"] = ctc_loss.detach().cpu().item()
-    info["att_loss"] = att_loss.detach().cpu().item()
-    info["distill_loss"] = distillation_loss.detach().cpu().item()
-    info["loss"] = total_loss.detach().cpu().item()
-
-    # `utt_duration` and `utt_pad_proportion` would be normalized by `utterances`
-    info["utterances"] = feature.size(0)
-    # averaged input duration in frames over utterances
-    info["utt_duration"] = supervisions["num_frames"].sum().item()
-    # averaged padding proportion over utterances
-    info["utt_pad_proportion"] = (
-        ((feature.size(1) - supervisions["num_frames"]) / feature.size(1)).sum().item()
-    )
-
-    return total_loss, info
-
-def compute_ctc_loss(
-    params: AttributeDict,
-    graph_compiler: BpeCtcTrainingGraphCompiler,
-    nnet_output,
-    supervisions,
-):
     supervision_segments, texts = encode_supervisions(
         supervisions, subsampling_factor=params.subsampling_factor
     )
@@ -891,39 +523,71 @@ def compute_ctc_loss(
     else:
         raise ValueError(f"Unsupported type of graph compiler: {type(graph_compiler)}")
 
-    # Compute CTC loss
     dense_fsa_vec = k2.DenseFsaVec(
         nnet_output,
         supervision_segments,
         allow_truncate=max(params.subsampling_factor - 1, 10),
+        # allow_truncate=0
     )
+    # print("nnet_output shape: ", nnet_output.shape)
+    # print("supervisions: ", supervisions)
+    # print("supervision_segments: ", supervision_segments)
+    # print("graph_compiler: ", graph_compiler)
+    # Remove assertion that causes issues with subsampling
+    # assert supervision_segments[:, 2].max() <= nnet_output.size(1), \
+    # "supervision_segments length exceeds nnet_output length"
     
     ctc_loss = k2.ctc_loss(
         decoding_graph=decoding_graph,
         dense_fsa_vec=dense_fsa_vec,
-        # target_lengths=target_lengths,  # Removed - not in original
         output_beam=params.beam_size,
-        reduction=params.reduction,  # Use original params.reduction
+        reduction=params.reduction,
         use_double_scores=params.use_double_scores,
     )
+
+    if params.att_rate != 0.0:
+        with torch.set_grad_enabled(is_training):
+            mmodel = model.module if hasattr(model, "module") else model
+            # Note: We need to generate an unsorted version of token_ids
+            # `encode_supervisions()` called above sorts text, but
+            # encoder_memory and memory_mask are not sorted, so we
+            # use an unsorted version `supervisions["text"]` to regenerate
+            # the token_ids
+            #
+            # See https://github.com/k2-fsa/icefall/issues/97
+            # for more details
+            unsorted_token_ids = graph_compiler.texts_to_ids(supervisions["text"])
+            att_loss = mmodel.decoder_forward(
+                encoder_memory,
+                memory_mask,
+                token_ids=unsorted_token_ids,
+                sos_id=graph_compiler.sos_id,
+                eos_id=graph_compiler.eos_id,
+            )
+        loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
+    else:
+        loss = ctc_loss
+        att_loss = torch.tensor([0])
+
+    assert loss.requires_grad == is_training
+
     
-    # Stabilize CTC loss for fine-tuning with converged models
-    if ctc_loss.item() < 0:
-        # For fine-tuning with converged models, negative CTC loss can occur
-        # Apply a conservative fix: clamp to small positive value
-        min_loss = 0.1  # Minimum positive loss value
-        ctc_loss = torch.clamp(torch.abs(ctc_loss), min=min_loss)
-    
-    if torch.isnan(ctc_loss) or torch.isinf(ctc_loss):
-        ctc_loss = torch.tensor(1.0, device=ctc_loss.device, requires_grad=True)
-    
-    # Additional check: if loss is too large, it might indicate numerical issues
-    if ctc_loss.item() > 1000000:
-        if params.batch_idx_train % 100 == 0:
-            logging.warning(f"Very large CTC loss detected: {ctc_loss.item()}, clamping to reasonable range")
-        ctc_loss = torch.clamp(ctc_loss, max=100000.0)
-    
-    return ctc_loss, supervision_segments
+    info = MetricsTracker()
+    info["frames"] = supervision_segments[:, 2].sum().item()
+    info["ctc_loss"] = ctc_loss.detach().cpu().item()
+    info["att_loss"] = att_loss.detach().cpu().item()
+    info["loss"] = loss.detach().cpu().item()
+
+    # `utt_duration` and `utt_pad_proportion` would be normalized by `utterances`  # noqa
+    info["utterances"] = feature.size(0)
+    # averaged input duration in frames over utterances
+    info["utt_duration"] = supervisions["num_frames"].sum().item()
+    # averaged padding proportion over utterances
+    info["utt_pad_proportion"] = (
+        ((feature.size(1) - supervisions["num_frames"]) / feature.size(1)).sum().item()
+    )
+
+    return loss, info
 
 
 def compute_validation_loss(
@@ -964,12 +628,6 @@ def compute_validation_loss(
 
         logging.info("Validation loss computation completed")
 
-        # Check if WER computation should be skipped
-        if params.validation_skip_wer:
-            logging.info("Skipping WER computation as requested")
-            return tot_loss, None
-
-        # TODO: Re-enable WER computation after fixing decode_dataset issues
         # Always compute WER for analysis
         logging.info("Starting WER computation...")
         
@@ -1061,33 +719,19 @@ def compute_validation_loss(
             logging.error(f"decode_dataset failed: {e}")
             logging.error("Skipping WER computation for this validation")
             # Restore original beam parameters
-            if params.validation_decoding_method == "greedy":
-                params.search_beam = original_search_beam
-                params.output_beam = original_output_beam
-            else:
-                params.search_beam = original_search_beam
-                params.output_beam = original_output_beam
+            params.search_beam = original_search_beam
+            params.output_beam = original_output_beam
             
             logging.info(f"Validation loss: {loss_value:.4f}")
             return tot_loss, None
         
         # Restore original beam parameters
-        if params.validation_decoding_method == "greedy":
-            params.search_beam = original_search_beam
-            params.output_beam = original_output_beam
-        else:
-            params.search_beam = original_search_beam
-            params.output_beam = original_output_beam
+        params.search_beam = original_search_beam
+        params.output_beam = original_output_beam
         
         logging.info("Starting save_results...")
         
-        try:
-            wer_results = save_results(params=params, test_set_name=f"epoch_{epoch}_validation", results_dict=results_dict)
-        except Exception as e:
-            logging.error(f"save_results failed: {e}")
-            logging.error("Skipping WER computation due to save_results error")
-            logging.info(f"Validation loss: {loss_value:.4f}")
-            return tot_loss, None
+        wer_results = save_results(params=params, test_set_name=f"epoch_{epoch}_validation", results_dict=results_dict)
         
         # Log WER results
         if wer_results:
@@ -1152,8 +796,6 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
-    ema_teacher: Optional[EMATeacher] = None,
-    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1182,7 +824,7 @@ def train_one_epoch(
     model.train()
 
     tot_loss = MetricsTracker()
-    
+
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
@@ -1193,7 +835,6 @@ def train_one_epoch(
             batch=batch,
             graph_compiler=graph_compiler,
             is_training=True,
-            ema_teacher=ema_teacher,
         )
         # summary stats
         tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -1203,15 +844,8 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         loss.backward()
-        # More conservative gradient clipping for fine-tuning
-        clip_grad_norm_(model.parameters(), 1.0, 2.0)  # Reduced from 5.0 to 1.0
+        clip_grad_norm_(model.parameters(), 5.0, 2.0)
         optimizer.step()
-        
-        # Update EMA teacher model after optimizer step
-        if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-            ema_teacher.update(model)
-            if params.batch_idx_train % 1000 == 0:  # Log every 1000 steps instead of 100
-                logging.info(f"EMA teacher updated at step {params.batch_idx_train}")
 
         if batch_idx % params.log_interval == 0:
             logging.info(
@@ -1251,13 +885,6 @@ def train_one_epoch(
                 logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}, WER: {validation_wer:.2f}%")
             else:
                 logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
-            
-            # Update scheduler if using ReduceLROnPlateau
-            if scheduler is not None and params.scheduler_type == "plateau":
-                validation_loss = valid_info["loss"] / valid_info["frames"]
-                scheduler.step(validation_loss)
-                current_lr = optimizer.param_groups[0]['lr']
-                logging.info(f"Scheduler step: validation_loss={validation_loss:.6f}, current_lr={current_lr:.2e}")
                         
             # Save checkpoint after validation (only rank 0)
             if rank == 0:
@@ -1271,7 +898,6 @@ def train_one_epoch(
                         suffix=f"val-{batch_idx}",
                         wer_value=validation_wer,
                         step=batch_idx,
-                        epoch=params.cur_epoch
                     )
                     logging.info(f"Checkpoint saved successfully for batch {batch_idx}")
                 except Exception as e:
@@ -1384,79 +1010,33 @@ def run(rank, world_size, args):
         )
 
     logging.info("About to create model")
-    
-    # Parse distill_layers argument from string to List[int] if needed
-    distill_layers = params.distill_layers
-    if isinstance(distill_layers, str):
-        distill_layers = [int(x) for x in distill_layers.split(',') if x.strip()]
-    
-    logging.info(f"Model creation parameters: distill_layers={distill_layers}, knowledge_type={params.knowledge}")
-
     model = Conformer(
         num_features=params.feature_dim,
-        num_classes=num_classes,
         nhead=params.nhead,
+        d_model=params.attention_dim,
+        num_classes=num_classes,
         subsampling_factor=params.subsampling_factor,
+        num_decoder_layers=params.num_decoder_layers,
         vgg_frontend=False,
         use_feat_batchnorm=params.use_feat_batchnorm,
     )
+
+    checkpoints = load_checkpoint_if_available(params=params, model=model)
+
     model.to(device)
-    logging.info(f"Model created: distill_layers={model.distill_layers if hasattr(model, 'distill_layers') else 'NOT FOUND'}")
     if world_size > 1:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        
-    # Create optimizer and scheduler based on scheduler_type
-    logging.info(f"Scheduler type: {params.scheduler_type}")
-    logging.info(f"Base LR: {getattr(params, 'base_lr', 'NOT SET')}")
-    
-    if params.scheduler_type == "noam":
-        optimizer = Noam(
-            model.parameters(),
-            model_size=params.attention_dim,
-            factor=params.lr_factor,
-            warm_step=params.warm_step,
-            weight_decay=params.weight_decay,
-        )
-        scheduler = None  # Noam optimizer handles scheduling internally
-        logging.info(f"Using Noam optimizer with lr_factor={params.lr_factor}")
-    else:
-        # Use Adam optimizer for plateau and constant schedulers
-        base_lr = getattr(params, 'base_lr', 2e-5)  # Default fallback
-        logging.info(f"Using Adam optimizer with base_lr={base_lr}")
-        
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=base_lr,
-            weight_decay=params.weight_decay,
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
-        
-        if params.scheduler_type == "plateau":
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=params.scheduler_factor,
-                patience=params.scheduler_patience,
-                min_lr=params.min_lr,
-                verbose=True
-            )
-            logging.info(f"Using ReduceLROnPlateau scheduler: "
-                        f"lr={params.base_lr}, patience={params.scheduler_patience}, "
-                        f"factor={params.scheduler_factor}, min_lr={params.min_lr}")
-        elif params.scheduler_type == "constant":
-            scheduler = None  # No scheduler for constant learning rate
-            logging.info(f"Using constant learning rate: {params.base_lr}")
-        else:
-            raise ValueError(f"Unknown scheduler type: {params.scheduler_type}")
-    
-    logging.info(f"Optimizer type: {type(optimizer).__name__}")
-    logging.info(f"Scheduler type: {params.scheduler_type}")
-    
-    # Debug optimizer state
-    for param_group in optimizer.param_groups:
-        logging.info(f"Optimizer param group lr: {param_group['lr']}")
-        break  # Just check first param group
+
+    optimizer = Noam(
+        model.parameters(),
+        model_size=params.attention_dim,
+        factor=params.lr_factor,
+        warm_step=params.warm_step,
+        weight_decay=params.weight_decay,
+    )
+
+    if checkpoints:
+        optimizer.load_state_dict(checkpoints["optimizer"])
 
     librispeech = LibriSpeechAsrDataModule(args)
 
@@ -1477,9 +1057,8 @@ def run(rank, world_size, args):
         return 1.0 <= c.duration <= 20.0
 
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
-    
-    # For self-distillation: use shuffle=True with fixed seed for deterministic but diverse ordering
-    train_dl = librispeech.train_dataloaders(train_cuts, shuffle=True)
+
+    train_dl = librispeech.train_dataloaders(train_cuts)
 
     # Use only dev_clean for faster validation (dev_other can be added later)
     valid_cuts = librispeech.dev_clean_cuts()
@@ -1487,7 +1066,7 @@ def run(rank, world_size, args):
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
     
     logging.info(f"Validation set size: {len(valid_cuts)} utterances")
-    
+
     if params.sanity_check:
         scan_pessimistic_batches_for_oom(
             model=model,
@@ -1497,39 +1076,12 @@ def run(rank, world_size, args):
             params=params,
         )
     else: pass
-    
-    # Initialize EMA Teacher Model for self-distillation (must be before checkpoint loading)
-    ema_teacher = None
-    if params.enable_self_distillation:
-        logging.info(f"Initializing EMA teacher model with decay={params.ema_decay}, start_step={params.ema_start_step}")
-        ema_teacher = EMATeacher(model, decay=params.ema_decay, device=device)    
-
-    checkpoints = load_checkpoint_if_available(
-        params=params, 
-        model=model, 
-        ema_teacher=ema_teacher
-    )    
-    # Load optimizer state from checkpoint if available
-    if checkpoints and "optimizer" in checkpoints: 
-        try:
-            optimizer.load_state_dict(checkpoints["optimizer"])
-            logging.info("Successfully loaded optimizer state from checkpoint")
-        except (ValueError, KeyError, RuntimeError) as e:
-            logging.warning(f"Failed to load optimizer state: {e}")
-            logging.warning("Starting with fresh optimizer state")
-            # Continue training with fresh optimizer state
-    
 
     for epoch in range(params.start_epoch, params.num_epochs):
         fix_random_seed(params.seed + epoch)
         train_dl.sampler.set_epoch(epoch)
 
-        # Get current learning rate based on optimizer type
-        if params.scheduler_type == "noam" and hasattr(optimizer, '_rate'):
-            cur_lr = optimizer._rate
-        else:
-            cur_lr = optimizer.param_groups[0]['lr']
-            
+        cur_lr = optimizer._rate
         if tb_writer is not None:
             tb_writer.add_scalar("train/learning_rate", cur_lr, params.batch_idx_train)
             tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
@@ -1549,8 +1101,6 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
-            ema_teacher=ema_teacher,
-            scheduler=scheduler,
         )
 
         save_checkpoint(
@@ -1558,7 +1108,6 @@ def run(rank, world_size, args):
             model=model,
             optimizer=optimizer,
             rank=rank,
-            ema_teacher=ema_teacher,
         )
 
     logging.info("Done!")
@@ -1566,6 +1115,7 @@ def run(rank, world_size, args):
     if world_size > 1:
         torch.distributed.barrier()
         cleanup_dist()
+
 
 def scan_pessimistic_batches_for_oom(
     model: nn.Module,
@@ -1616,6 +1166,7 @@ def log_prediction_examples(results_dict, max_examples=5, force_log=False):
         max_examples: Maximum number of examples to log
         force_log: Force logging regardless of sample counter
     """
+    global _VALIDATION_SAMPLE_COUNTER
     
     if not results_dict:
         return
@@ -1627,29 +1178,44 @@ def log_prediction_examples(results_dict, max_examples=5, force_log=False):
     if not results:
         return
     
+    # Update the validation sample counter
+    _VALIDATION_SAMPLE_COUNTER += len(results)
     
-    # Still compute and log basic statistics, just not the detailed examples
-    total_sample_wer = 0
-    valid_samples = 0
+    # Only log to terminal every 50 samples (or when forced)
+    should_log_to_terminal = force_log or (_VALIDATION_SAMPLE_COUNTER % 50 == 0) or (_VALIDATION_SAMPLE_COUNTER <= 50)
     
-    for result in results:
-        if len(result) >= 3:
-            cut_id, ref_words, hyp_words = result[0], result[1], result[2]
-            ref_text = " ".join(ref_words) if isinstance(ref_words, list) else str(ref_words)
-            hyp_text = " ".join(hyp_words) if isinstance(hyp_words, list) else str(hyp_words)
-            
-            ref_word_list = ref_text.split()
-            hyp_word_list = hyp_text.split()
-            
-            if len(ref_word_list) > 0:
-                import difflib
-                matcher = difflib.SequenceMatcher(None, ref_word_list, hyp_word_list)
-                word_errors = len(ref_word_list) + len(hyp_word_list) - 2 * sum(triple.size for triple in matcher.get_matching_blocks())
-                utt_wer = (word_errors / len(ref_word_list)) * 100
-                total_sample_wer += utt_wer
-                valid_samples += 1
+    if not should_log_to_terminal:
+        # Still compute and log basic statistics, just not the detailed examples
+        total_sample_wer = 0
+        valid_samples = 0
+        
+        for result in results:
+            if len(result) >= 3:
+                cut_id, ref_words, hyp_words = result[0], result[1], result[2]
+                ref_text = " ".join(ref_words) if isinstance(ref_words, list) else str(ref_words)
+                hyp_text = " ".join(hyp_words) if isinstance(hyp_words, list) else str(hyp_words)
+                
+                ref_word_list = ref_text.split()
+                hyp_word_list = hyp_text.split()
+                
+                if len(ref_word_list) > 0:
+                    import difflib
+                    matcher = difflib.SequenceMatcher(None, ref_word_list, hyp_word_list)
+                    word_errors = len(ref_word_list) + len(hyp_word_list) - 2 * sum(triple.size for triple in matcher.get_matching_blocks())
+                    utt_wer = (word_errors / len(ref_word_list)) * 100
+                    total_sample_wer += utt_wer
+                    valid_samples += 1
+        
+        # Log summary info only
+        if valid_samples > 0:
+            avg_example_wer = total_sample_wer / valid_samples
+            logging.info(f"Validation batch processed: {valid_samples} samples "
+                        f"(total samples processed: {_VALIDATION_SAMPLE_COUNTER}, detailed examples every 50 samples)")
+        return
     
-
+    # Full detailed logging when we hit the 50-sample threshold
+    logging.info(f"Detailed validation examples (sample #{_VALIDATION_SAMPLE_COUNTER - len(results) + 1}-{_VALIDATION_SAMPLE_COUNTER}):")
+    
     # Select diverse examples: some short, some long, some with errors, some perfect
     selected_examples = []
     

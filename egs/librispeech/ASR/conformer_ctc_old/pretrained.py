@@ -271,7 +271,7 @@ def main():
         use_feat_batchnorm=params.use_feat_batchnorm,
     )
 
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu")
     model.load_state_dict(checkpoint["model"], strict=False)
     model.to(device)
     model.eval()
@@ -351,9 +351,7 @@ def main():
         "attention-decoder",
     ]:
         logging.info(f"Loading HLG from {params.HLG}")
-        HLG = k2.Fsa.from_dict(
-            torch.load(params.HLG, map_location="cpu", weights_only=False)
-        )
+        HLG = k2.Fsa.from_dict(torch.load(params.HLG, map_location="cpu"))
         HLG = HLG.to(device)
         if not hasattr(HLG, "lm_scores"):
             # For whole-lattice-rescoring and attention-decoder
@@ -364,9 +362,7 @@ def main():
             "attention-decoder",
         ]:
             logging.info(f"Loading G from {params.G}")
-            G = k2.Fsa.from_dict(
-                torch.load(params.G, map_location="cpu", weights_only=False)
-            )
+            G = k2.Fsa.from_dict(torch.load(params.G, map_location="cpu"))
             # Add epsilon self-loops to G as we will compose
             # it with the whole lattice later
             G = G.to(device)

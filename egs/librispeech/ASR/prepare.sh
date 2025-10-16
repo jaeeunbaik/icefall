@@ -3,12 +3,18 @@
 # fix segmentation fault reported in https://github.com/k2-fsa/icefall/issues/674
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
+# Ensure this script runs under bash even if invoked from zsh or other shells.
+# This avoids "bad substitution" and other incompatibilities in sourced helpers.
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -eou pipefail
 
 nj=30
 # run step 0 to step 5 by default
-stage=-1  # 1
-stop_stage=-1  # 6
+stage=1  # 1
+stop_stage=7  # 6
 
 # Note: This script just prepare the minimal requirements that needed by a
 # transducer training with bpe units.
@@ -54,7 +60,7 @@ stop_stage=-1  # 6
 #        - librispeech-lexicon.txt
 #        - librispeech-lm-norm.txt.gz
 
-dl_dir=/home/hdd1/jenny
+dl_dir=/home/nas3/DB/Librispeech/raw
 
 . shared/parse_options.sh || exit 1
 
@@ -62,9 +68,9 @@ dl_dir=/home/hdd1/jenny
 # It will generate data/lang_bpe_xxx,
 # data/lang_bpe_yyy if the array contains xxx, yyy
 vocab_sizes=(
-  5000
+  # 5000
   # 2000
-  # 1000
+  1024
   # 500
 )
 
@@ -119,7 +125,7 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
   # to $dl_dir/LibriSpeech
   mkdir -p data/manifests
   if [ ! -e data/manifests/.librispeech.done ]; then
-    lhotse prepare librispeech -j $nj $dl_dir/LibriSpeech/LibriSpeech data/manifests
+    lhotse prepare librispeech -j $nj $dl_dir/LibriSpeech data/manifests
     touch data/manifests/.librispeech.done
   fi
 fi
@@ -187,14 +193,12 @@ if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
 
     if [ ! -f $lang_dir/transcript_words.txt ]; then
       log "Generate data for BPE training"
-      files=$(
-        find "$dl_dir/LibriSpeech/train-clean-100" -name "*.trans.txt"
-        find "$dl_dir/LibriSpeech/train-clean-360" -name "*.trans.txt"
-        find "$dl_dir/LibriSpeech/train-other-500" -name "*.trans.txt"
-      )
-      for f in ${files[@]}; do
-        cat $f | cut -d " " -f 2-
-      done > $lang_dir/transcript_words.txt
+      # Use find -exec to avoid 'argument list too long' and handle many files robustly.
+      {
+        find "$dl_dir/LibriSpeech/train-clean-100" -type f -name "*.trans.txt" -exec cat {} +
+        find "$dl_dir/LibriSpeech/train-clean-360" -type f -name "*.trans.txt" -exec cat {} +
+        find "$dl_dir/LibriSpeech/train-other-500" -type f -name "*.trans.txt" -exec cat {} +
+      } | cut -d " " -f 2- > "$lang_dir/transcript_words.txt"
     fi
 
     if [ ! -f $lang_dir/bpe.model ]; then

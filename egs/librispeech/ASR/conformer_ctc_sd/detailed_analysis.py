@@ -5,7 +5,7 @@ Detailed test to understand attention map size changes and encoder output struct
 
 import torch
 import torch.nn as nn
-from conformer_ctc import ConformerCTC
+from conformer_ctc_old import ConformerCTC
 
 def test_attention_map_sizes():
     """Test attention map sizes at different layers"""

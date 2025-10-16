@@ -4,7 +4,7 @@ Simple explanation of attention map sizes and encoder outputs
 """
 
 import torch
-from conformer_ctc import ConformerCTC
+from conformer_ctc_old import ConformerCTC
 
 def explain_attention_map_sizes():
     """Explain how attention map sizes are determined"""
