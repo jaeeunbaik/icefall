@@ -2,6 +2,7 @@
 
 # train_sd.sh - LibriSpeech ASR Self-Distillation Training Script
 # Usage: bash train_sd.sh
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 
 set -euo pipefail
 
