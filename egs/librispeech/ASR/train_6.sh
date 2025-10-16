@@ -50,14 +50,14 @@ validation_skip_wer=false              # Skip WER computation for even faster va
 # Distillation Hyperparameters
 enable_self_distillation=true
 distill_layers=17
-distill_loss_type="mse"         # mse, cosine, kl
-alpha=50
+distill_loss_type="cos"         # mse, cos, kl
+alpha=600000
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 knowledge="encoder-output"      # "encoder-output", "attention-map"
 distill_temperature=1.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd/train70000-epoch77-avg10/exp_mse_0.1:1_single
+exp_dir=conformer_ctc_sd/train70000-epoch77-avg10/exp_cs_1:1_single
 
 #
 spec_aug_time_warp_factor=100              # default: 100

@@ -8,7 +8,7 @@ set -euo pipefail
 # Data Augmentation Controls (modify these as needed)
 enable_spec_aug=true          # SpecAugment (frequency/time masking)
 enable_musan=true             # MUSAN noise augmentation
-enable_cutmix=true 
+enable_cutmix=false 
 enable_concatenate=false   
 
 # Training parameters
@@ -36,7 +36,7 @@ valid_interval=500000           # Much larger interval if we enable validation l
 
 # Learning Rate Scheduler Settings (Fine-tuning options)
 scheduler_type="plateau"       # "noam", "plateau", "constant"
-base_lr=7e-6                 # Base learning rate for plateau/constant schedulers
+base_lr=1e-5                 # Base learning rate for plateau/constant schedulers
 scheduler_patience=3          # Patience for ReduceLROnPlateau
 scheduler_factor=0.5          # Factor for ReduceLROnPlateau (0.5 = 50% reduction)
 min_lr=5e-6          
@@ -51,13 +51,13 @@ validation_skip_wer=false              # Skip WER computation for even faster va
 enable_self_distillation=true
 distill_layers=17
 distill_loss_type="mse"         # mse, cosine, kl
-alpha=200000
+alpha=2000
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 knowledge="encoder-output"      # "encoder-output", "attention-map"
 distill_temperature=1.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_teacher_freezed/train70000-epoch77-avg10/exp_mse20:1_single_stronger
+exp_dir=conformer_ctc_sd/train70000-epoch77-avg10/exp_mse_20:1_single
 
 #
 spec_aug_time_warp_factor=100              # default: 100
@@ -75,7 +75,7 @@ else
     export PYTHONPATH="${PYTHONPATH}:/tmp/icefall"
 fi
 
-CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_teacher_freezed/train.py \
+CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd/train.py \
     --exp-dir $exp_dir \
     --master-port $master_port \
     --sanity-check $sanity_check \
