@@ -4,3 +4,4 @@ run*.sh
 exp*/
 e.dataset.sampling.cut_samplers import SimpleCutSampler
 *.log
+*.sh

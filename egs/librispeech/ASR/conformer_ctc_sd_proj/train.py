@@ -142,7 +142,7 @@ def get_parser():
     parser.add_argument(
         "--bpe-dir",
         type=str,
-        default="./data/lang_bpe_5000",
+        default="./data/lang_bpe_1024",
         help="""The lang dir
         It contains language related input files such as
         "lexicon.txt"
@@ -369,6 +369,21 @@ def get_parser():
         type=str2bool,
         default=False,
         help="Skip WER computation during validation for faster validation (only compute loss).",
+    )
+    
+    parser.add_argument(
+        "--use-proj-layer",
+        type=str2bool,
+        default=True,
+        help="Whether to use projection layer between encoder and decoder for self-distillation.",
+    )
+    
+    parser.add_argument(
+        "--proj-layer-training",
+        type=str,
+        default="full-finetuning",
+        choices=["full-finetuning", "only-proj"],
+        help="Training method for self distillation: 'full-finetuning' for fine-tuning all parameters, 'only-proj' for training only proj layer, else freezed.",
     )
     
     return parser
@@ -1180,6 +1195,20 @@ def train_one_epoch(
         Number of nodes in DDP training. If it is 1, DDP is disabled.
     """
     model.train()
+    
+    # Log parameter training status at the start of each epoch
+    if rank == 0:  # Only log from main process
+        actual_model = model.module if hasattr(model, 'module') else model
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        
+        logging.info(f"Epoch {params.cur_epoch} - Training mode: {params.proj_layer_training}")
+        logging.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+        
+        # Check if projection layer is being trained
+        if hasattr(actual_model, 'proj_layer') and actual_model.use_proj_layer:
+            proj_trainable = any(p.requires_grad for p in actual_model.proj_layer.parameters())
+            logging.info(f"Projection layer trainable: {proj_trainable}")
 
     tot_loss = MetricsTracker()
     
@@ -1206,6 +1235,24 @@ def train_one_epoch(
         # More conservative gradient clipping for fine-tuning
         clip_grad_norm_(model.parameters(), 1.0, 2.0)  # Reduced from 5.0 to 1.0
         optimizer.step()
+        
+        # Debug: Check parameter updates for "only-proj" mode
+        if params.proj_layer_training == "only-proj" and batch_idx % 1000 == 0 and rank == 0:
+            actual_model = model.module if hasattr(model, 'module') else model
+            if hasattr(actual_model, 'proj_layer') and actual_model.use_proj_layer:
+                # Check if projection layer parameters have gradients
+                proj_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 
+                                  for p in actual_model.proj_layer.parameters() if p.requires_grad)
+                
+                # Check other parameters don't have gradients (should be None or zero)
+                other_params_with_grad = 0
+                for name, param in actual_model.named_parameters():
+                    if 'proj_layer' not in name and param.requires_grad and param.grad is not None:
+                        if param.grad.abs().sum() > 0:
+                            other_params_with_grad += 1
+                
+                logging.info(f"Step {params.batch_idx_train}: proj_layer has grad: {proj_has_grad}, "
+                           f"other params with grad: {other_params_with_grad}")
         
         # Update EMA teacher model after optimizer step
         if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
@@ -1331,6 +1378,21 @@ def run(rank, world_size, args):
     setup_logger(f"{params.exp_dir}/log/log-train")
     logging.info("Training started")
     logging.info(f"Warmup steps: {params.warm_step}")
+    
+    # Log projection layer training configuration
+    logging.info("=" * 60)
+    logging.info("PROJECTION LAYER TRAINING CONFIGURATION")
+    logging.info("=" * 60)
+    logging.info(f"Use projection layer: {params.use_proj_layer}")
+    logging.info(f"Projection layer training mode: {params.proj_layer_training}")
+    logging.info(f"Self-distillation enabled: {params.enable_self_distillation}")
+    if params.proj_layer_training == "only-proj":
+        logging.info("→ Only projection layer parameters will be updated")
+        logging.info("→ All other parameters will be frozen")
+    elif params.proj_layer_training == "full-finetuning":
+        logging.info("→ All model parameters will be updated")
+    logging.info("=" * 60)
+    
     logging.info(params)
 
     if args.tensorboard and rank == 0:
@@ -1399,11 +1461,54 @@ def run(rank, world_size, args):
         subsampling_factor=params.subsampling_factor,
         vgg_frontend=False,
         use_feat_batchnorm=params.use_feat_batchnorm,
+        use_proj_layer=params.use_proj_layer,
     )
     model.to(device)
+    
+    # Configure parameter training based on proj_layer_training setting
+    if params.proj_layer_training == "only-proj":
+        logging.info("Setting up projection layer only training - freezing all parameters except projection layer")
+        
+        # Freeze all parameters first
+        for param in model.parameters():
+            param.requires_grad = False
+        
+        # Unfreeze only projection layer parameters
+        if hasattr(model, 'proj_layer') and model.use_proj_layer:
+            for param in model.proj_layer.parameters():
+                param.requires_grad = True
+            logging.info("Projection layer parameters unfrozen for training")
+        else:
+            logging.warning("Projection layer not found or disabled! No parameters will be trained.")
+            
+        # Count trainable parameters
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        logging.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+        
+    elif params.proj_layer_training == "full-finetuning":
+        logging.info("Setting up full fine-tuning - all parameters will be trained")
+        
+        # Ensure all parameters are trainable (default behavior)
+        for param in model.parameters():
+            param.requires_grad = True
+            
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logging.info(f"All parameters are trainable: {trainable_params:,}")
+        
+    else:
+        raise ValueError(f"Unknown proj_layer_training mode: {params.proj_layer_training}")
+    
     logging.info(f"Model created: distill_layers={model.distill_layers if hasattr(model, 'distill_layers') else 'NOT FOUND'}")
     if world_size > 1:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+    
+    # Get trainable parameters for optimizer (important for "only-proj" mode)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if len(trainable_params) == 0:
+        raise ValueError("No trainable parameters found! Check proj_layer_training configuration.")
+    
+    logging.info(f"Optimizer will update {len(trainable_params)} parameter tensors")
         
     # Create optimizer and scheduler based on scheduler_type
     logging.info(f"Scheduler type: {params.scheduler_type}")
@@ -1411,7 +1516,7 @@ def run(rank, world_size, args):
     
     if params.scheduler_type == "noam":
         optimizer = Noam(
-            model.parameters(),
+            trainable_params,  # Only pass trainable parameters
             model_size=params.attention_dim,
             factor=params.lr_factor,
             warm_step=params.warm_step,
@@ -1425,7 +1530,7 @@ def run(rank, world_size, args):
         logging.info(f"Using Adam optimizer with base_lr={base_lr}")
         
         optimizer = torch.optim.Adam(
-            model.parameters(),
+            trainable_params,  # Only pass trainable parameters
             lr=base_lr,
             weight_decay=params.weight_decay,
             betas=(0.9, 0.999),
@@ -1508,7 +1613,28 @@ def run(rank, world_size, args):
         params=params, 
         model=model, 
         ema_teacher=ema_teacher
-    )    
+    )
+    
+    # Re-apply parameter freezing after checkpoint loading (checkpoint might overwrite requires_grad)
+    if params.proj_layer_training == "only-proj":
+        logging.info("Re-applying projection layer only training after checkpoint loading")
+        
+        # Freeze all parameters first
+        for param in model.parameters():
+            param.requires_grad = False
+        
+        # Unfreeze only projection layer parameters
+        actual_model = model.module if hasattr(model, 'module') else model
+        if hasattr(actual_model, 'proj_layer') and actual_model.use_proj_layer:
+            for param in actual_model.proj_layer.parameters():
+                param.requires_grad = True
+            logging.info("Projection layer parameters re-unfrozen after checkpoint loading")
+        
+        # Verify parameter state after checkpoint loading
+        trainable_params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params_count = sum(p.numel() for p in model.parameters())
+        logging.info(f"After checkpoint loading - Trainable: {trainable_params_count:,} / {total_params_count:,}")
+    
     # Load optimizer state from checkpoint if available
     if checkpoints and "optimizer" in checkpoints: 
         try:

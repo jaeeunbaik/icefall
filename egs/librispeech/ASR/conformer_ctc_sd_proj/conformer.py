@@ -57,6 +57,7 @@ class Conformer(Transformer):
         normalize_before: bool = True,
         vgg_frontend: bool = False,
         use_feat_batchnorm: Union[float, bool] = 0.1,
+        use_proj_layer: bool = True,
     ) -> None:
         super(Conformer, self).__init__(
             num_features=num_features,
@@ -95,10 +96,14 @@ class Conformer(Transformer):
             # Note: TorchScript detects that self.after_norm could be used inside forward()
             #       and throws an error without this change.
             self.after_norm = identity
+        
+        self.use_proj_layer = use_proj_layer
+        if use_proj_layer:
+            self.proj_layer = nn.Linear(d_model, d_model)
 
     def run_encoder(
         self, x: Tensor, supervisions: Optional[Supervisions] = None
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
         """
         Args:
           x:
@@ -129,6 +134,9 @@ class Conformer(Transformer):
 
         if self.normalize_before:
             x = self.after_norm(x)
+        
+        if self.use_proj_layer:
+            x = self.proj_layer(x)
 
         return x, mask, layer_results, att_maps
 

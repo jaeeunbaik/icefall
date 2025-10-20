@@ -42,6 +42,7 @@ class Transformer(nn.Module):
         normalize_before: bool = True,
         vgg_frontend: bool = False,
         use_feat_batchnorm: Union[float, bool] = 0.1,
+        use_proj_layer: bool = False,
     ) -> None:
         """
         Args:
@@ -191,7 +192,7 @@ class Transformer(nn.Module):
 
     def run_encoder(
         self, x: torch.Tensor, supervisions: Optional[Supervisions] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run the transformer encoder.
 
         Args:
@@ -206,11 +207,13 @@ class Transformer(nn.Module):
             to compute the encoder padding mask, which is used as memory key
             padding mask for the decoder.
         Returns:
-          Return a tuple with two tensors:
+          Return a tuple with four tensors:
             - The encoder output, with shape (T, N, C)
             - encoder padding mask, with shape (N, T).
               The mask is None if `supervisions` is None.
               It is used as memory key padding mask in the decoder.
+            - layer_results: None for base Transformer (used by Conformer)
+            - att_maps: None for base Transformer (used by Conformer)
         """
         x = self.encoder_embed(x)
         x = self.encoder_pos(x)
@@ -219,7 +222,7 @@ class Transformer(nn.Module):
         mask = mask.to(x.device) if mask is not None else None
         x = self.encoder(x, src_key_padding_mask=mask)  # (T, N, C)
 
-        return x, mask
+        return x, mask, None, None
 
     def ctc_output(self, x: torch.Tensor) -> torch.Tensor:
         """

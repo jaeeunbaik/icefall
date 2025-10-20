@@ -9,9 +9,9 @@ valid_max_duration=40          # 4x increase to match (15->60)
 num_buckets=300                 # 2x increase for better bucketing with larger batches
 num_workers=8                  # Keep same for stability
 lang_dir="./data/lang_bpe_1024"
-exp_dir="conformer_ctc/exp_12000"    # Ultra slow warmup experiment
+exp_dir="conformer_ctc/exp_24000"    # Ultra slow warmup experiment
 method="ctc-decoding"
-warm_step=12000               
+warm_step=24000               
 lr_factor=5.0                  # Even smaller learning rate factor
 weight_decay=1e-6              # Stronger regularization
 

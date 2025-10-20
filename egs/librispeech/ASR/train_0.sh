@@ -8,7 +8,7 @@ set -euo pipefail
 # Data Augmentation Controls (modify these as needed)
 enable_spec_aug=true          # SpecAugment (frequency/time masking)
 enable_musan=true             # MUSAN noise augmentation
-enable_cutmix=true 
+enable_cutmix=false 
 enable_concatenate=false   
 
 # Training parameters
@@ -36,7 +36,7 @@ valid_interval=500000           # Much larger interval if we enable validation l
 
 # Learning Rate Scheduler Settings (Fine-tuning options)
 scheduler_type="plateau"       # "noam", "plateau", "constant"
-base_lr=7e-6                 # Base learning rate for plateau/constant schedulers
+base_lr=1e-4                 # Base learning rate for plateau/constant schedulers
 scheduler_patience=3          # Patience for ReduceLROnPlateau
 scheduler_factor=0.5          # Factor for ReduceLROnPlateau (0.5 = 50% reduction)
 min_lr=5e-6          
@@ -48,25 +48,25 @@ validation_output_beam=5.0             # Output beam for validation (only used i
 validation_skip_wer=false              # Skip WER computation for even faster validation (디버깅용 - 이제 false로 변경)
 
 # Distillation Hyperparameters
-enable_self_distillation=true
+enable_self_distillation=false
 distill_layers=17
 distill_loss_type="mse"         # mse, cosine, kl
-alpha=200000
+alpha=0
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 knowledge="encoder-output"      # "encoder-output", "attention-map"
 distill_temperature=1.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_teacher_freezed/train70000-epoch77-avg10/exp_mse20:1_single_stronger
+exp_dir=conformer_ctc/train70000-epoch77-avg10/exp_ft_1e-4_pla
 
 #
 spec_aug_time_warp_factor=100              # default: 100
-spec_aug_num_frame_masks=6                # default: 2  
-spec_aug_features_mask_size=40            # default: 27
-spec_aug_num_feature_masks=4              # default: 2
-spec_aug_frames_mask_size=150             # default: 100
-musan_ratio=0.9                           # default: 0.5
-snr_range=0,5
+spec_aug_num_frame_masks=2                # default: 2  
+spec_aug_features_mask_size=27            # default: 27
+spec_aug_num_feature_masks=2              # default: 2
+spec_aug_frames_mask_size=100             # default: 100
+musan_ratio=0.5                           # default: 0.5
+snr_range=5,10
 
 
 if [ -z "${PYTHONPATH:-}" ]; then
@@ -75,7 +75,7 @@ else
     export PYTHONPATH="${PYTHONPATH}:/tmp/icefall"
 fi
 
-CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_teacher_freezed/train.py \
+CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd/train.py \
     --exp-dir $exp_dir \
     --master-port $master_port \
     --sanity-check $sanity_check \
