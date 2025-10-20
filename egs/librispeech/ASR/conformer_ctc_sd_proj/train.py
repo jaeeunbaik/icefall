@@ -833,7 +833,7 @@ def compute_loss(
     s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
     if t_output is not None:
         t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
-        ctc_loss = 0.1 * t_ctc_loss + 0.9 * s_ctc_loss
+        ctc_loss = 0.2 * t_ctc_loss + 0.8 * s_ctc_loss
     else:
         ctc_loss = s_ctc_loss
 
