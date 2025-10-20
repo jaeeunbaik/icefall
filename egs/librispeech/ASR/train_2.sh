@@ -13,9 +13,9 @@ enable_concatenate=false
 
 # Training parameters
 world_size=1 
-max_duration=350
+max_duration=200
 valid_max_duration=15         
-num_buckets=250               
+num_buckets=200               
 num_workers=4    
 warm_step=10000
 lang_dir="./data/lang_bpe_1024"
@@ -51,7 +51,7 @@ validation_skip_wer=false              # Skip WER computation for even faster va
 enable_self_distillation=true
 distill_layers=17
 distill_loss_type="mse"         # mse, cosine, kl
-alpha=100
+alpha=100000
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 knowledge="encoder-output"      # "encoder-output", "attention-map"
 distill_temperature=1.0

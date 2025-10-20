@@ -773,9 +773,37 @@ def compute_loss(
                 distill_layers = [int(params.distill_layers)]
             
             if params.knowledge == "encoder-output":
-                # Extract encoder outputs for distillation
-                if hiddens is not None and t_hidden is not None:
+                # Extract encoder outputs for distillation with projection layers
+                if params.use_proj_layer and len(distill_layers) > 0:
+                    # Use get_intermediate_outputs for projection-applied distillation layers
+                    if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+                        teacher_model = ema_teacher.get_teacher_model()
+                        with torch.no_grad():
+                            teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
+                    else:
+                        with torch.no_grad():
+                            teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
                     
+                    # Get student projected outputs
+                    student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
+                    
+                    if teacher_projected_outputs and student_projected_outputs:
+                        from conformer import compute_multi_layer_distillation_loss
+                        distillation_loss = compute_multi_layer_distillation_loss(
+                            teacher_knowledge=teacher_projected_outputs,
+                            student_knowledge=student_projected_outputs,
+                            knowledge_lens=output_lens,
+                            layer_indices=list(range(len(distill_layers))),  # Use sequential indices since we already filtered layers
+                            loss_type=params.distill_loss_type,
+                            knowledge_type="encoder-output",
+                            aggregation=params.distill_aggregation,
+                        )
+                    else:
+                        logging.warning("Failed to get projected outputs for distillation")
+                        distillation_loss = torch.tensor(0.0, device=model_device)
+                
+                elif hiddens is not None and t_hidden is not None:
+                    # Fallback to original method when projection is disabled
                     # Import the multi-layer distillation function
                     from conformer import compute_multi_layer_distillation_loss
                     
@@ -833,7 +861,7 @@ def compute_loss(
     s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
     if t_output is not None:
         t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
-        ctc_loss = 0.2 * t_ctc_loss + 0.8 * s_ctc_loss
+        ctc_loss = 0.1 * t_ctc_loss + 0.9 * s_ctc_loss
     else:
         ctc_loss = s_ctc_loss
 
@@ -1462,6 +1490,7 @@ def run(rank, world_size, args):
         vgg_frontend=False,
         use_feat_batchnorm=params.use_feat_batchnorm,
         use_proj_layer=params.use_proj_layer,
+        distill_layers=distill_layers,
     )
     model.to(device)
     
@@ -1480,6 +1509,12 @@ def run(rank, world_size, args):
             logging.info("Projection layer parameters unfrozen for training")
         else:
             logging.warning("Projection layer not found or disabled! No parameters will be trained.")
+        
+        # Unfreeze distillation projection heads
+        if hasattr(model, 'distill_projection_heads') and model.distill_projection_heads:
+            for param in model.distill_projection_heads.parameters():
+                param.requires_grad = True
+            logging.info(f"Distillation projection heads parameters unfrozen for training (layers: {distill_layers})")
             
         # Count trainable parameters
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

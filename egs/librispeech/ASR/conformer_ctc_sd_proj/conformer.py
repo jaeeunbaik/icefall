@@ -58,6 +58,7 @@ class Conformer(Transformer):
         vgg_frontend: bool = False,
         use_feat_batchnorm: Union[float, bool] = 0.1,
         use_proj_layer: bool = True,
+        distill_layers: Optional[list] = None,
     ) -> None:
         super(Conformer, self).__init__(
             num_features=num_features,
@@ -100,6 +101,13 @@ class Conformer(Transformer):
         self.use_proj_layer = use_proj_layer
         if use_proj_layer:
             self.proj_layer = nn.Linear(d_model, d_model)
+        
+        # Initialize distillation layer projection heads
+        self.distill_layers = distill_layers if distill_layers is not None else []
+        self.distill_projection_heads = nn.ModuleList()
+        if self.distill_layers and use_proj_layer:
+            for _ in self.distill_layers:
+                self.distill_projection_heads.append(nn.Linear(d_model, d_model))
 
     def run_encoder(
         self, x: Tensor, supervisions: Optional[Supervisions] = None
@@ -139,6 +147,65 @@ class Conformer(Transformer):
             x = self.proj_layer(x)
 
         return x, mask, layer_results, att_maps
+
+    def get_intermediate_outputs(
+        self, x: Tensor, supervisions: Optional[Supervisions] = None
+    ) -> list:
+        """
+        Get intermediate outputs from selected distillation layers with projection.
+        
+        Args:
+          x:
+            The model input. Its shape is (N, T, C).
+          supervisions:
+            Supervision in lhotse format.
+
+        Returns:
+            List of projected embeddings from selected distillation layers.
+        """
+        if not self.distill_layers:
+            return []
+            
+        x = self.encoder_embed(x)
+        x, pos_emb = self.encoder_pos(x)
+        x = x.permute(1, 0, 2)  # (B, T, F) -> (T, B, F)
+        mask = encoder_padding_mask(x.size(0), supervisions)
+        if mask is not None:
+            mask = mask.to(x.device)
+        
+        # Get layer outputs for selected distillation layers
+        layer_outputs = []
+        output = x
+        for layer_idx, mod in enumerate(self.encoder.layers):
+            output, _ = mod(
+                output,
+                pos_emb,
+                src_mask=None,
+                src_key_padding_mask=mask,
+            )
+            if layer_idx in self.distill_layers:
+                layer_outputs.append(output)
+        
+        # Apply projection heads to selected layer outputs
+        projected_embeddings = []
+        if self.use_proj_layer and self.distill_projection_heads:
+            for i, layer_output in enumerate(layer_outputs):
+                if i < len(self.distill_projection_heads):
+                    # Apply normalization if needed
+                    if self.normalize_before:
+                        normalized_output = self.after_norm(layer_output)
+                    else:
+                        normalized_output = layer_output
+                    
+                    # Apply projection
+                    projected = self.distill_projection_heads[i](normalized_output)
+                    projected_embeddings.append(projected)
+                else:
+                    projected_embeddings.append(layer_output)
+        else:
+            projected_embeddings = layer_outputs
+            
+        return projected_embeddings
 
 
 class ConformerEncoderLayer(nn.Module):

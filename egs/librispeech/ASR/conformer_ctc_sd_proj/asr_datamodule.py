@@ -310,7 +310,7 @@ class LibriSpeechAsrDataModule:
         group.add_argument(
             "--return-cuts",
             type=str2bool,
-            default=True,
+            default=False,
             help="When enabled, each batch will have the "
             "field: batch['supervisions']['cut'] with the cuts that "
             "were used to construct it.",
