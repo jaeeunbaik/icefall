@@ -9,6 +9,7 @@ set -euo pipefail
 enable_spec_aug=true          # SpecAugment (frequency/time masking)
 enable_musan=true             # MUSAN noise augmentation
 enable_cutmix=false 
+enable_cutmix=false 
 enable_concatenate=false   
 
 # Training parameters
@@ -40,6 +41,7 @@ base_lr=7e-6                 # Base learning rate for plateau/constant scheduler
 scheduler_patience=3          # Patience for ReduceLROnPlateau
 scheduler_factor=0.5          # Factor for ReduceLROnPlateau (0.5 = 50% reduction)
 min_lr=5e-6          
+min_lr=5e-6          
 
 # Validation decoding settings
 validation_decoding_method="greedy"    # "greedy" or "beam" - use greedy for faster validation
@@ -53,8 +55,8 @@ distill_layers=17
 distill_loss_type="mse"         # mse, cosine, kl
 alpha=10000
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
-knowledge="encoder-output"      # "encoder-output", "attention-map"
-distill_temperature=1.0
+knowledge="attention-map"      # "encoder-output", "attention-map"
+distill_temperature=4.0
 ema_decay=0.999
 ema_start_step=1000
 exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_mse_7e-6_0.1:1
