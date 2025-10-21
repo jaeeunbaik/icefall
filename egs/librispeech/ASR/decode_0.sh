@@ -19,10 +19,11 @@ else
     export PYTHONPATH="${PYTHONPATH}:/tmp/icefall"
 fi
 
-CUDA_VISIBLE_DEVICES=0 python ./conformer_ctc_sd/decode.py \
+CUDA_VISIBLE_DEVICES=0 python ./conformer_ctc_sd_proj/decode.py \
     --method ctc-decoding \
     --max-duration 10 \
-    --epoch 9 \
-    --avg 4 \
-    --exp-dir conformer_ctc_sd/train70000-epoch77-avg10/exp_mse20:1_single
-
+    --epoch 1 \
+    --avg 2 \
+    --exp-dir conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_mse_1e-5_20:1/models \
+    --include-proj-layer True \
+    --distill-layers 17

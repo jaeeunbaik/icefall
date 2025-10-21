@@ -204,6 +204,20 @@ def get_parser():
         last output linear layer
         """,
     )
+    parser.add_argument(
+        "--include-proj-layer",
+        type=str2bool,
+        default=True,
+        help="""True to include projection layer when decoding"""
+    )
+    parser.add_argument(
+        "--distill-layers",
+        type=str,
+        default="17",
+        help="Which encoder layer(s) to use for distillation (0-based). "
+             "Can be a single layer (e.g., '6') or comma-separated list (e.g., '4,6,8'). "
+             "Clean and noisy outputs from these layers will be compared.",
+    )
 
     return parser
 
@@ -820,23 +834,76 @@ def main():
         G.lm_scores = G.scores.clone()
     else:
         G = None
-
-    model = Conformer(
-        num_features=params.feature_dim,
-        num_classes=params.num_classes,
-        num_decoder_layers=0,
-        nhead=params.nhead,
-        subsampling_factor=params.subsampling_factor,
-        vgg_frontend=params.vgg_frontend,
-        use_feat_batchnorm=params.use_feat_batchnorm,
-    )
-
-    if params.avg == 1:
-        load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
-    else:
-        model = load_averaged_model(
-            params.exp_dir, model, params.epoch, params.avg, device
+    
+    # Model creation based on include_proj_layer option
+    if params.include_proj_layer:
+        logging.info("Creating model WITH projection layers")
+        distill_layers = params.distill_layers
+        if isinstance(distill_layers, str):
+            distill_layers = [int(x) for x in distill_layers.split(',') if x.strip()]
+    
+        model = Conformer(
+            num_features=params.feature_dim,
+            num_classes=params.num_classes,
+            num_decoder_layers=0,
+            nhead=params.nhead,
+            subsampling_factor=params.subsampling_factor,
+            vgg_frontend=params.vgg_frontend,
+            use_feat_batchnorm=params.use_feat_batchnorm,
+            use_proj_layer=True,  # Enable projection layer
+            distill_layers=distill_layers,
         )
+    else:
+        logging.info("Creating model WITHOUT projection layers")
+        model = Conformer(
+            num_features=params.feature_dim,
+            num_classes=params.num_classes,
+            num_decoder_layers=0,
+            nhead=params.nhead,
+            subsampling_factor=params.subsampling_factor,
+            vgg_frontend=params.vgg_frontend,
+            use_feat_batchnorm=params.use_feat_batchnorm,
+            use_proj_layer=False,  # Disable projection layer
+            distill_layers=None,  # No distillation layers
+        )
+
+    # Load checkpoint (handle potential parameter mismatches)
+    if params.avg == 1:
+        try:
+            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
+        except RuntimeError as e:
+            if "size mismatch" in str(e) or "Missing key" in str(e):
+                logging.warning(f"Parameter mismatch detected: {e}")
+                logging.warning("Loading checkpoint with strict=False to handle projection layer differences")
+                # Manual loading with strict=False
+                checkpoint = torch.load(f"{params.exp_dir}/epoch-{params.epoch}.pt", map_location="cpu")
+                if "model" in checkpoint:
+                    state_dict = checkpoint["model"]
+                else:
+                    state_dict = checkpoint
+                model.load_state_dict(state_dict, strict=False)
+            else:
+                raise e
+    else:
+        try:
+            model = load_averaged_model(
+                params.exp_dir, model, params.epoch, params.avg, device
+            )
+        except RuntimeError as e:
+            if "size mismatch" in str(e) or "Missing key" in str(e):
+                logging.warning(f"Parameter mismatch detected during averaging: {e}")
+                logging.warning("Model averaging with projection layer differences may not work properly")
+                # For averaged model, we'll need to handle this differently
+                # For now, fall back to single epoch loading
+                logging.warning("Falling back to single epoch loading...")
+                checkpoint = torch.load(f"{params.exp_dir}/epoch-{params.epoch}.pt", map_location="cpu")
+                if "model" in checkpoint:
+                    state_dict = checkpoint["model"]
+                else:
+                    state_dict = checkpoint
+                model.load_state_dict(state_dict, strict=False)
+            else:
+                raise e
 
     model.to(device)
     model.eval()
