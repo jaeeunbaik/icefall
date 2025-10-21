@@ -1590,6 +1590,7 @@ def load_averaged_model(
     epoch: int,
     avg: int,
     device: torch.device,
+    strict: bool,
 ):
     """
     Load a model which is the average of all checkpoints
@@ -1610,7 +1611,7 @@ def load_averaged_model(
 
     logging.info(f"averaging {filenames}")
     model.to(device)
-    model.load_state_dict(average_checkpoints(filenames, device=device))
+    model.load_state_dict(average_checkpoints(filenames, device=device, strict=strict))
 
     return model
 

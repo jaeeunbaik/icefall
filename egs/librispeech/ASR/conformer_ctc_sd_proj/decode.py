@@ -30,7 +30,7 @@ from asr_datamodule import LibriSpeechAsrDataModule
 from conformer import Conformer
 
 from icefall.bpe_graph_compiler import BpeCtcTrainingGraphCompiler
-from icefall.checkpoint import load_checkpoint
+from icefall.checkpoint import load_checkpoint, average_checkpoints
 from icefall.decode import (
     get_lattice,
     nbest_decoding,
@@ -46,12 +46,44 @@ from icefall.rnn_lm.model import RnnLmModel
 from icefall.utils import (
     AttributeDict,
     get_texts,
-    load_averaged_model,
     setup_logger,
     store_transcripts,
     str2bool,
     write_error_stats,
 )
+
+
+
+def load_averaged_model(
+    model_dir: str,
+    model: torch.nn.Module,
+    epoch: int,
+    avg: int,
+    device: torch.device,
+    strict: bool,
+):
+    """
+    Load a model which is the average of all checkpoints
+
+    :param model_dir: a str of the experiment directory
+    :param model: a torch.nn.Module instance
+
+    :param epoch: the last epoch to load from
+    :param avg: how many models to average from
+    :param device: move model to this device
+
+    :return: A model averaged
+    """
+
+    # start cannot be negative
+    start = max(epoch - avg + 1, 0)
+    filenames = [f"{model_dir}/epoch-{i}.pt" for i in range(start, epoch + 1)]
+
+    logging.info(f"averaging {filenames}")
+    model.to(device)
+    model.load_state_dict(average_checkpoints(filenames, device=device), strict=strict)
+
+    return model
 
 
 def get_parser():
@@ -203,6 +235,20 @@ def get_parser():
         help="""True to share the weights between the input embedding layer and the
         last output linear layer
         """,
+    )
+    parser.add_argument(
+        "--include-proj-layer",
+        type=str2bool,
+        default=True,
+        help="""True to include projection layer when decoding"""
+    )
+    parser.add_argument(
+        "--distill-layers",
+        type=str,
+        default="17",
+        help="Which encoder layer(s) to use for distillation (0-based). "
+             "Can be a single layer (e.g., '6') or comma-separated list (e.g., '4,6,8'). "
+             "Clean and noisy outputs from these layers will be compared.",
     )
 
     return parser
@@ -820,28 +866,69 @@ def main():
         G.lm_scores = G.scores.clone()
     else:
         G = None
-
-    model = Conformer(
-        num_features=params.feature_dim,
-        num_classes=params.num_classes,
-        num_decoder_layers=0,
-        nhead=params.nhead,
-        subsampling_factor=params.subsampling_factor,
-        vgg_frontend=params.vgg_frontend,
-        use_feat_batchnorm=params.use_feat_batchnorm,
-    )
-
-    if params.avg == 1:
-        load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
-    else:
-        model = load_averaged_model(
-            params.exp_dir, model, params.epoch, params.avg, device
+    
+    # Model creation based on include_proj_layer option
+    if params.include_proj_layer:
+        logging.info("Creating model WITH projection layers")
+        distill_layers = params.distill_layers
+        if isinstance(distill_layers, str):
+            distill_layers = [int(x) for x in distill_layers.split(',') if x.strip()]
+    
+        model = Conformer(
+            num_features=params.feature_dim,
+            num_classes=params.num_classes,
+            num_decoder_layers=0,
+            nhead=params.nhead,
+            subsampling_factor=params.subsampling_factor,
+            vgg_frontend=params.vgg_frontend,
+            use_feat_batchnorm=params.use_feat_batchnorm,
+            use_proj_layer=True,  # Enable projection layer
+            distill_layers=distill_layers,
         )
+        
+        if params.avg == 1:
+            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
+        else:
+            model = load_averaged_model(
+                params.exp_dir, model, params.epoch, params.avg, device
+            )
+
+        model.to(device)
+        model.eval()
+        num_param = sum([p.numel() for p in model.parameters()])
+        logging.info(f"Number of model parameters: {num_param}")
+
+        model.to(device)
+        model.eval()
+        num_param = sum([p.numel() for p in model.parameters()])
+        logging.info(f"Number of model parameters: {num_param}")
+        
+    else:
+        logging.info("Creating model WITHOUT projection layers")
+        model = Conformer(
+            num_features=params.feature_dim,
+            num_classes=params.num_classes,
+            num_decoder_layers=0,
+            nhead=params.nhead,
+            subsampling_factor=params.subsampling_factor,
+            vgg_frontend=params.vgg_frontend,
+            use_feat_batchnorm=params.use_feat_batchnorm,
+            use_proj_layer=False,  # Disable projection layer
+            distill_layers=None,  # No distillation layers
+        )
+        
+        if params.avg == 1:
+            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model, strict=False)
+        else:
+            model = load_averaged_model(
+                params.exp_dir, model, params.epoch, params.avg, device, strict=False
+            )
 
     model.to(device)
     model.eval()
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
+
 
     rnn_lm_model = None
     if params.method == "rnn-lm":
