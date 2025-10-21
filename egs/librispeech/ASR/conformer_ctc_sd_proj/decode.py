@@ -890,19 +890,9 @@ def main():
             load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
         else:
             model = load_averaged_model(
-                params.exp_dir, model, params.epoch, params.avg, device
+                params.exp_dir, model, params.epoch, params.avg, device, strict=True
             )
 
-        model.to(device)
-        model.eval()
-        num_param = sum([p.numel() for p in model.parameters()])
-        logging.info(f"Number of model parameters: {num_param}")
-
-        model.to(device)
-        model.eval()
-        num_param = sum([p.numel() for p in model.parameters()])
-        logging.info(f"Number of model parameters: {num_param}")
-        
     else:
         logging.info("Creating model WITHOUT projection layers")
         model = Conformer(
@@ -918,7 +908,7 @@ def main():
         )
         
         if params.avg == 1:
-            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model, strict=False)
+            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
         else:
             model = load_averaged_model(
                 params.exp_dir, model, params.epoch, params.avg, device, strict=False

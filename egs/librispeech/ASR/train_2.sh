@@ -16,7 +16,7 @@ world_size=1
 max_duration=200
 valid_max_duration=15         
 num_buckets=200               
-num_workers=4    
+num_workers=8    
 warm_step=10000
 lang_dir="./data/lang_bpe_1024"
 method="ctc-decoding"
@@ -36,7 +36,7 @@ valid_interval=500000           # Much larger interval if we enable validation l
 
 # Learning Rate Scheduler Settings (Fine-tuning options)
 scheduler_type="plateau"       # "noam", "plateau", "constant"
-base_lr=1e-5                 # Base learning rate for plateau/constant schedulers
+base_lr=7e-6                 # Base learning rate for plateau/constant schedulers
 scheduler_patience=3          # Patience for ReduceLROnPlateau
 scheduler_factor=0.5          # Factor for ReduceLROnPlateau (0.5 = 50% reduction)
 min_lr=5e-6          
@@ -57,7 +57,7 @@ knowledge="encoder-output"      # "encoder-output", "attention-map"
 distill_temperature=1.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_mse_1e-5_1:1
+exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_mse_7e-6_1:1
 
 #
 spec_aug_time_warp_factor=100              # default: 100
