@@ -23,7 +23,13 @@ CUDA_VISIBLE_DEVICES=0 python ./conformer_ctc_sd_proj/decode.py \
     --method ctc-decoding \
     --max-duration 10 \
     --epoch 1 \
+<<<<<<< HEAD
     --avg 1 \
     --exp-dir conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_mse_1e-5_20:1/models \
     --include-proj-layer False \
+=======
+    --avg 2 \
+    --exp-dir conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_mse_1e-5_20:1/models \
+    --include-proj-layer True \
+>>>>>>> 28958b141bb31ecff6a3230378a4b2d4c3046072
     --distill-layers 17

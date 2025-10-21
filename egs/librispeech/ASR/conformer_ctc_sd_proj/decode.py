@@ -885,24 +885,6 @@ def main():
             use_proj_layer=True,  # Enable projection layer
             distill_layers=distill_layers,
         )
-        
-        if params.avg == 1:
-            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
-        else:
-            model = load_averaged_model(
-                params.exp_dir, model, params.epoch, params.avg, device
-            )
-
-        model.to(device)
-        model.eval()
-        num_param = sum([p.numel() for p in model.parameters()])
-        logging.info(f"Number of model parameters: {num_param}")
-
-        model.to(device)
-        model.eval()
-        num_param = sum([p.numel() for p in model.parameters()])
-        logging.info(f"Number of model parameters: {num_param}")
-        
     else:
         logging.info("Creating model WITHOUT projection layers")
         model = Conformer(
@@ -916,13 +898,44 @@ def main():
             use_proj_layer=False,  # Disable projection layer
             distill_layers=None,  # No distillation layers
         )
-        
-        if params.avg == 1:
-            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model, strict=False)
-        else:
+
+    # Load checkpoint (handle potential parameter mismatches)
+    if params.avg == 1:
+        try:
+            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
+        except RuntimeError as e:
+            if "size mismatch" in str(e) or "Missing key" in str(e):
+                logging.warning(f"Parameter mismatch detected: {e}")
+                logging.warning("Loading checkpoint with strict=False to handle projection layer differences")
+                # Manual loading with strict=False
+                checkpoint = torch.load(f"{params.exp_dir}/epoch-{params.epoch}.pt", map_location="cpu")
+                if "model" in checkpoint:
+                    state_dict = checkpoint["model"]
+                else:
+                    state_dict = checkpoint
+                model.load_state_dict(state_dict, strict=False)
+            else:
+                raise e
+    else:
+        try:
             model = load_averaged_model(
-                params.exp_dir, model, params.epoch, params.avg, device, strict=False
+                params.exp_dir, model, params.epoch, params.avg, device
             )
+        except RuntimeError as e:
+            if "size mismatch" in str(e) or "Missing key" in str(e):
+                logging.warning(f"Parameter mismatch detected during averaging: {e}")
+                logging.warning("Model averaging with projection layer differences may not work properly")
+                # For averaged model, we'll need to handle this differently
+                # For now, fall back to single epoch loading
+                logging.warning("Falling back to single epoch loading...")
+                checkpoint = torch.load(f"{params.exp_dir}/epoch-{params.epoch}.pt", map_location="cpu")
+                if "model" in checkpoint:
+                    state_dict = checkpoint["model"]
+                else:
+                    state_dict = checkpoint
+                model.load_state_dict(state_dict, strict=False)
+            else:
+                raise e
 
     model.to(device)
     model.eval()
