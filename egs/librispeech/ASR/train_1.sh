@@ -16,9 +16,9 @@ enable_concatenate=false
 
 # Training parameters
 world_size=1 
-max_duration=200
+max_duration=300
 valid_max_duration=15         
-num_buckets=200               
+num_buckets=300               
 num_workers=8    
 warm_step=10000
 lang_dir="./data/lang_bpe_1024"
@@ -53,15 +53,15 @@ validation_skip_wer=false              # Skip WER computation for even faster va
 
 # Distillation Hyperparameters
 enable_self_distillation=true
-distill_layers=17
-distill_loss_type="mse"         # mse, cosine, kl
-alpha=10000
+distill_layers=3,5,7
+distill_loss_type="kl"         # mse, cosine, kl
+alpha=500000000000
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 knowledge="attention-map"      # "encoder-output", "attention-map"
 distill_temperature=4.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_mse_5e-5_0.1:1
+exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_kl_layer3,5,7
 
 #
 spec_aug_time_warp_factor=100              # default: 100
@@ -75,7 +75,7 @@ snr_range=0,5
 #
 use_proj_layer=True
 proj_layer_training="full-finetuning"       # full-finetuning, only-proj
-return_cuts=True
+return_cuts=False
 on_the_fly_feats=True
 
 
