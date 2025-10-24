@@ -68,35 +68,49 @@ class CleanNoisyWrapper:
         }
     }
     """
-    def __init__(self, base_dataset, augmentation_transforms=None, input_transforms=None):
+    def __init__(self, base_dataset, augmentation_transforms=None, input_transforms=None, clean_augmentation_transforms=None, clean_input_transforms=None):
         """
         Args:
             base_dataset: K2SpeechRecognitionDataset (clean, no transforms)
             augmentation_transforms: List of cut transforms for noisy version
             input_transforms: List of input transforms (e.g., SpecAugment) for noisy
+            clean_augmentation_transforms: List of cut transforms for clean version (optional, lighter augmentation)
+            clean_input_transforms: List of input transforms for clean version (optional, lighter augmentation)
         """
         self.base_dataset = base_dataset
         self.augmentation_transforms = augmentation_transforms or []
         self.input_transforms = input_transforms or []
+        self.clean_augmentation_transforms = clean_augmentation_transforms or []
+        self.clean_input_transforms = clean_input_transforms or []
         
         logging.info("CleanNoisyWrapper initialized")
-        logging.info(f"Augmentation transforms: {[type(t).__name__ for t in self.augmentation_transforms]}")
-        logging.info(f"Input transforms: {[type(t).__name__ for t in self.input_transforms]}")
+        logging.info(f"Noisy augmentation transforms: {[type(t).__name__ for t in self.augmentation_transforms]}")
+        logging.info(f"Noisy input transforms: {[type(t).__name__ for t in self.input_transforms]}")
+        logging.info(f"Clean augmentation transforms: {[type(t).__name__ for t in self.clean_augmentation_transforms]}")
+        logging.info(f"Clean input transforms: {[type(t).__name__ for t in self.clean_input_transforms]}")
     
     def __getitem__(self, cuts):
         """
         GUARANTEED clean-noisy alignment by processing same cuts twice.
         
         Process:
-        1. Get clean version from base dataset (no transforms)
-        2. Apply transforms to same cuts for noisy version
-        3. Both versions have identical source → Perfect alignment
+        1. Get base version from base dataset (completely raw)
+        2. Apply light transforms to create clean version (optional)
+        3. Apply heavy transforms to create noisy version
+        4. Both versions have identical source → Perfect alignment
         """
-        # Step 1: Get clean version (original, no augmentation)
-        clean_batch = self.base_dataset[cuts]
+        # Step 1: Get base version (completely raw, no augmentation)
+        base_batch = self.base_dataset[cuts]
         
-        # Step 2: Create noisy version by applying transforms to same cuts
-        noisy_batch = self._create_noisy_version(cuts, clean_batch)
+        # Step 2: Create clean version (with optional light augmentation)
+        if self.clean_augmentation_transforms or self.clean_input_transforms:
+            clean_batch = self._create_clean_version(cuts, base_batch)
+        else:
+            # No clean augmentation - use base as-is
+            clean_batch = base_batch
+        
+        # Step 3: Create noisy version by applying heavy transforms to same cuts
+        noisy_batch = self._create_noisy_version(cuts, base_batch)
         
         # Clean-Noisy alignment verified and working correctly
         
@@ -115,19 +129,69 @@ class CleanNoisyWrapper:
             }
         }
     
-    def _create_noisy_version(self, cuts, clean_batch):
+    def _create_clean_version(self, cuts, base_batch):
+        """
+        동일한 cuts에서 clean 버전 생성 (가벼운 augmentation 적용)
+        
+        전략: Base batch의 supervisions는 그대로 복사 (100% 동일성 보장)
+              Features에만 가벼운 증강 적용
+        """
+        try:
+            import torch
+            
+            # Step 1: Base의 supervisions를 그대로 복사 (완벽한 동일성 보장)
+            clean_supervisions = {}
+            for key, value in base_batch['supervisions'].items():
+                if isinstance(value, torch.Tensor):
+                    clean_supervisions[key] = value.clone()
+                elif isinstance(value, (list, tuple)):
+                    clean_supervisions[key] = list(value)  # 리스트 복사
+                else:
+                    clean_supervisions[key] = value
+            
+            # Step 2: Features 시작점은 base와 동일
+            clean_inputs = base_batch['inputs'].clone()
+            
+            # Step 3: Clean input transforms 적용 (가벼운 SpecAugment 등)
+            if self.clean_input_transforms:
+                for transform in self.clean_input_transforms:
+                    try:
+                        if hasattr(transform, '__call__'):
+                            clean_inputs = transform(clean_inputs)
+                    except Exception as e:
+                        logging.warning(f"Clean input transform {type(transform).__name__} failed: {e}")
+            
+            # Step 4: Clean cut-level transforms (가벼운 noise 등)
+            if self.clean_augmentation_transforms:
+                logging.debug(f"Clean cut transforms applied: {[type(t).__name__ for t in self.clean_augmentation_transforms]}")
+                # 실제 Cut transform 적용 로직이 필요하면 여기에 추가
+            
+            # Step 5: 결과 생성
+            clean_batch = {
+                'inputs': clean_inputs,
+                'supervisions': clean_supervisions  # 완전히 동일한 supervisions
+            }
+            
+            return clean_batch
+            
+        except Exception as e:
+            logging.error(f"Error in _create_clean_version: {e}")
+            # 에러 발생 시 원본 base_batch 반환
+            return base_batch
+    
+    def _create_noisy_version(self, cuts, base_batch):
         """
         동일한 cuts에서 noisy 버전 생성 - 완전히 동일한 소스 보장
         
-        전략: Clean batch의 supervisions는 그대로 복사 (100% 동일성 보장)
+        전략: Base batch의 supervisions는 그대로 복사 (100% 동일성 보장)
               Features만 증강 적용으로 변경
         """
         try:
             import torch
             
-            # Step 1: Clean의 supervisions를 그대로 복사 (완벽한 동일성 보장)
+            # Step 1: Base의 supervisions를 그대로 복사 (완벽한 동일성 보장)
             noisy_supervisions = {}
-            for key, value in clean_batch['supervisions'].items():
+            for key, value in base_batch['supervisions'].items():
                 if isinstance(value, torch.Tensor):
                     noisy_supervisions[key] = value.clone()
                 elif isinstance(value, (list, tuple)):
@@ -135,8 +199,8 @@ class CleanNoisyWrapper:
                 else:
                     noisy_supervisions[key] = value
             
-            # Step 2: Features 시작점은 clean과 동일
-            noisy_inputs = clean_batch['inputs'].clone()
+            # Step 2: Features 시작점은 base와 동일
+            noisy_inputs = base_batch['inputs'].clone()
             
             # Step 3: Input transforms 적용 (SpecAugment 등)
             # 이것만 차이가 나고, 나머지는 모두 동일
@@ -350,7 +414,7 @@ class LibriSpeechAsrDataModule:
         )
 
         group.add_argument(
-            "--spec-aug-features-mask-size",
+            "--spec-aug-feature-mask-size",
             type=int,
             default=27,
             help="Used only when --enable-spec-aug is True. "
@@ -358,7 +422,7 @@ class LibriSpeechAsrDataModule:
         )
 
         group.add_argument(
-            "--spec-aug-num-feature-masks",
+            "--spec-aug-num-features-masks",
             type=int,
             default=2,
             help="Used only when --enable-spec-aug is True. "
@@ -463,8 +527,8 @@ class LibriSpeechAsrDataModule:
                 SpecAugment(
                     time_warp_factor=self.args.spec_aug_time_warp_factor,
                     num_frame_masks=num_frame_masks,
-                    features_mask_size=self.args.spec_aug_features_mask_size,
-                    num_feature_masks=self.args.spec_aug_num_feature_masks,
+                    features_mask_size=self.args.spec_aug_feature_mask_size,
+                    num_feature_masks=self.args.spec_aug_num_features_masks,
                     frames_mask_size=self.args.spec_aug_frames_mask_size,
                 )
             )
@@ -508,13 +572,39 @@ class LibriSpeechAsrDataModule:
                 return_cuts=self.args.return_cuts,
             )
             
+            # Prepare clean augmentation transforms (much lighter than noisy)
+            clean_cut_transforms = []
+            clean_input_transforms = []
+            
+            if getattr(self.args, 'enable_clean_augmentation', False):
+                logging.info("Creating light augmentation for clean samples")
+                
+                # Clean SpecAugment (much lighter parameters)
+                clean_specaugment = SpecAugment(
+                    time_warp_factor=0,  # No time warping for clean
+                    num_time_masks=1,    # Only 1 mask vs 2-3 for noisy
+                    time_mask_max_frames=getattr(self.args, 'clean_specaugment_time_mask_max_frames', 5),  # Much smaller
+                    num_freq_masks=1,    # Only 1 mask vs 2-3 for noisy
+                    freq_mask_max_bins=getattr(self.args, 'clean_specaugment_freq_mask_max_bins', 3),      # Much smaller
+                    p=getattr(self.args, 'clean_augmentation_prob', 0.1),  # Lower probability
+                )
+                clean_input_transforms.append(clean_specaugment)
+                
+                logging.info(f"Clean augmentation: prob={getattr(self.args, 'clean_augmentation_prob', 0.1)}, "
+                           f"time_mask_max={getattr(self.args, 'clean_specaugment_time_mask_max_frames', 5)}, "
+                           f"freq_mask_max={getattr(self.args, 'clean_specaugment_freq_mask_max_bins', 3)}")
+            else:
+                logging.info("Clean augmentation disabled - using completely clean samples")
+            
             # Create wrapper that uses same cuts for both clean and noisy
-            # Clean = base dataset as-is
-            # Noisy = same cuts + augmentation transforms applied on-the-fly
+            # Clean = base dataset + optional light augmentation
+            # Noisy = same cuts + heavy augmentation transforms applied on-the-fly
             train = CleanNoisyWrapper(
                 base_dataset=base_dataset,
-                augmentation_transforms=transforms,  # Cut transforms (MUSAN, RIR, etc)
-                input_transforms=input_transforms   # Input transforms (SpecAugment, etc)
+                augmentation_transforms=transforms,  # Cut transforms (MUSAN, RIR, etc) for noisy
+                input_transforms=input_transforms,   # Input transforms (SpecAugment, etc) for noisy
+                clean_augmentation_transforms=clean_cut_transforms,  # Light cut transforms for clean
+                clean_input_transforms=clean_input_transforms        # Light input transforms for clean
             )
             
             logging.info("Using single base dataset with on-the-fly augmentation")
