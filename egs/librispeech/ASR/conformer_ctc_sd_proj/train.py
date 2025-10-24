@@ -296,6 +296,40 @@ def get_parser():
              "Higher values make attention distributions smoother.",
     )
     
+    # Clean Augmentation Arguments for Self-Distillation
+    parser.add_argument(
+        "--enable-clean-augmentation",
+        type=str2bool,
+        default=False,
+        help="Enable light augmentation for clean samples in self-distillation. "
+             "When enabled, clean samples get lighter noise/augmentation compared to noisy samples.",
+    )
+    
+    parser.add_argument(
+        "--clean-augmentation-prob",
+        type=float,
+        default=0.1,
+        help="Probability of applying augmentation to clean samples. "
+             "Lower values maintain cleaner samples while adding slight variation. "
+             "Typical values: 0.05-0.2",
+    )
+    
+    parser.add_argument(
+        "--clean-specaugment-time-mask-max-frames",
+        type=int,
+        default=5,
+        help="Maximum time mask length for clean SpecAugment (much smaller than noisy). "
+             "Clean samples use lighter SpecAugment for slight variation.",
+    )
+    
+    parser.add_argument(
+        "--clean-specaugment-freq-mask-max-bins",
+        type=int,
+        default=3,
+        help="Maximum frequency mask bins for clean SpecAugment (much smaller than noisy). "
+             "Clean samples use lighter SpecAugment for slight variation.",
+    )
+    
     # EMA Teacher Model Arguments
     parser.add_argument(
         "--ema-decay",
