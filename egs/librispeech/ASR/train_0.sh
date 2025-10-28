@@ -21,7 +21,8 @@ valid_max_duration=15
 num_buckets=200               
 num_workers=8    
 warm_step=10000
-lang_dir="./data/lang_bpe_1024"
+lang_dir="/home/nas4/user/jaeeun/icefall/egs/librispeech/ASR/data/lang_bpe_1024/"
+manifest_dir="/home/nas4/user/jaeeun/icefall/egs/librispeech/ASR/data/fbank/"
 method="ctc-decoding"
 
 # Model parameters
@@ -32,7 +33,7 @@ num_decoder_layers=0          # 0 for pure CTC
 start_epoch=0
 master_port=12346
 sanity_check=false           # Set to true for OOM checking (slower)
-resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/zoo/conformer_ctc_70000_from77avg10.pt
+resume_from=/home/nas4/user/jaeeun/icefall/egs/librispeech/ASR/zoo/conformer_ctc_70000_from77avg10.pt
 
 enable_validation=true       # Temporarily disable validation to avoid crashes
 valid_interval=500000           # Much larger interval if we enable validation later
@@ -54,7 +55,7 @@ validation_skip_wer=false              # Skip WER computation for even faster va
 enable_self_distillation=true
 distill_layers=9,18
 distill_loss_type="kl"         # mse, cosine, kl
-alpha=500000000000
+alpha=50000000000
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 knowledge="attention-map"      # "encoder-output", "attention-map"
 distill_temperature=4.0
@@ -63,7 +64,7 @@ ema_start_step=1000
 exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_kl_layer9,18
 
 #
-spec_aug_time_warp_factor=100              # default: 100
+spec_aug_time_warp_factor=0              # default: 100
 spec_aug_num_frame_masks=6                # default: 2  
 spec_aug_features_mask_size=40            # default: 27
 spec_aug_num_feature_masks=6              # default: 2
@@ -106,6 +107,7 @@ CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_proj/train.py \
     --drop-last true \
     --shuffle true \
     --lang-dir $lang_dir \
+    --manifest-dir $manifest_dir \
     --method $method \
     --scheduler-type $scheduler_type \
     --base-lr $base_lr \
@@ -131,3 +133,10 @@ CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_proj/train.py \
     --proj-layer-training $proj_layer_training \
     --return-cuts $return_cuts \
     --on-the-fly-feats $on_the_fly_feats \
+    --spec-aug-time-warp-factor $spec_aug_time_warp_factor \
+    --spec-aug-num-frame-masks $spec_aug_num_frame_masks \
+    --spec-aug-features-mask-size $spec_aug_features_mask_size \
+    --spec-aug-num-feature-masks $spec_aug_num_feature_masks \
+    --spec-aug-frames-mask-size $spec_aug_frames_mask_size \
+    --musan-ratio $musan_ratio \
+    --snr-range $snr_range
