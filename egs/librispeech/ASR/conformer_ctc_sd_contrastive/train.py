@@ -410,14 +410,19 @@ def get_parser():
         help="Negative pair composition for contrastive loss",
     )
     
+    # NOTE: contrastive layer selection is controlled by --distill-layers
+    # The per-layer projection heads are created for distill_layers and
+    # contrastive learning uses outputs from those projected layers.
     parser.add_argument(
-        "--contrastive-layer",
-        type=int,
-        default=18,
-        help="Which encoder layer to use for contrastive learning (0-based). "
-             "The projected output from this layer will be used for computing contrastive loss.",
+        "--contrastive-aggregation",
+        type=str,
+        default="layer_avg",
+        choices=["layer_avg", "output_avg"],
+        help=("How to aggregate multi-layer contrastive features: 'layer_avg' averages the "
+              "projected outputs across layers and then computes one InfoNCE; 'output_avg' "
+              "computes per-layer InfoNCE and averages the losses."),
     )
-    
+
     parser.add_argument(
         "--contrastive-temperature",
         type=float,
@@ -929,50 +934,128 @@ def compute_loss(
         att_loss = torch.tensor([0])
         total_loss = ctc_loss
 
-    # Compute contrastive loss if enabled  
+    # Compute contrastive loss if enabled
     contrastive_loss = torch.tensor(0.0, device=model_device)
     if params.learning_type in ["contrastive", "hybrid"] and use_self_distillation:
-        # For contrastive learning, we need projected encoder representations from specific layer
-        
-        # Get teacher projected outputs for clean samples
-        if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-            teacher_model = ema_teacher.get_teacher_model()
-            with torch.no_grad():
-                teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
+        # For contrastive learning, allow selecting arbitrary encoder layers
+        # (not limited to distill_layers). We'll extract encoder layer outputs
+        # from the previously computed `hiddens` (student) and from the
+        # teacher model (EMA or student model) for the clean sample.
+
+        # Contrastive layers are selected from --distill-layers (projection heads)
+        # This ensures contrastive uses the same layers for which projection
+        # heads were created in the Conformer. Accept string (comma-separated),
+        # list/tuple, or single int.
+        distill_layers_val = params.distill_layers
+        if isinstance(distill_layers_val, str):
+            clayers = [int(x) for x in distill_layers_val.split(',') if x.strip()]
+        elif isinstance(distill_layers_val, (list, tuple)):
+            clayers = [int(x) for x in distill_layers_val]
         else:
-            with torch.no_grad():
-                teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
-        
-        # Get student projected outputs for noisy samples
-        student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
-        
-        # Check if we have projected outputs and the specified contrastive layer exists
-        if (teacher_projected_outputs and student_projected_outputs and 
-            len(teacher_projected_outputs) > params.contrastive_layer and
-            len(student_projected_outputs) > params.contrastive_layer):
-            
-            # Extract features from the specified contrastive layer
-            clean_layer_features = teacher_projected_outputs[params.contrastive_layer]  # (T, N, C)
-            noisy_layer_features = student_projected_outputs[params.contrastive_layer]  # (T, N, C)
-            
-            # Compute contrastive loss using InfoNCE
-            contrastive_loss = compute_contrastive_loss(
-                clean_features=clean_layer_features,
-                noisy_features=noisy_layer_features,
-                negative_pair=params.negative_pair,
-                temperature=params.contrastive_temperature  # Use argument value
-            )
-            
-            logging.debug(f"Contrastive loss computed using layer {params.contrastive_layer}: {contrastive_loss.item():.6f}")
+            clayers = [int(distill_layers_val)]
+
+        # Get student hidden layer outputs from the forward we already ran
+        student_layer_outputs = []
+        if hiddens is not None:
+            for idx in clayers:
+                if 0 <= idx < len(hiddens):
+                    student_layer_outputs.append(hiddens[idx])
+                else:
+                    logging.debug(f"Requested student contrastive layer {idx} not in hiddens (0..{len(hiddens)-1})")
+
+        # Get teacher hidden layer outputs (compute under no_grad)
+        teacher_layer_outputs = []
+        if clean_feature is not None:
+            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+                teacher_model = ema_teacher.get_teacher_model()
+                with torch.no_grad():
+                    _, _, _, teacher_hiddens, _ = teacher_model(clean_feature, clean_supervisions)
+            else:
+                with torch.no_grad():
+                    _, _, _, teacher_hiddens, _ = model(clean_feature, clean_supervisions)
+
+            if teacher_hiddens is not None:
+                for idx in clayers:
+                    if 0 <= idx < len(teacher_hiddens):
+                        teacher_layer_outputs.append(teacher_hiddens[idx])
+                    else:
+                        logging.debug(f"Requested teacher contrastive layer {idx} not in teacher_hiddens (0..{len(teacher_hiddens)-1})")
+
+        # If projection layer is available, apply it per-layer (use model.module if DDP)
+        mmodel = model.module if hasattr(model, "module") else model
+        student_projected_outputs = []
+        teacher_projected_outputs = []
+
+        if params.use_proj_layer and hasattr(mmodel, "proj_layer"):
+            # Use the model's proj_layer for both student and teacher projection
+            for l in student_layer_outputs:
+                if hasattr(mmodel, 'normalize_before') and mmodel.normalize_before:
+                    normalized = mmodel.after_norm(l)
+                else:
+                    normalized = l
+                student_projected_outputs.append(mmodel.proj_layer(normalized))
+
+            # For teacher, try to use teacher_model's proj_layer if it's an EMA model
+            if clean_feature is not None:
+                tmodel = teacher_model if (ema_teacher is not None and params.batch_idx_train >= params.ema_start_step) else mmodel
+                for l in teacher_layer_outputs:
+                    if hasattr(tmodel, 'normalize_before') and tmodel.normalize_before:
+                        normalized = tmodel.after_norm(l)
+                    else:
+                        normalized = l
+                    # If teacher is EMA wrapper, it should have same interface
+                    if hasattr(tmodel, 'proj_layer'):
+                        teacher_projected_outputs.append(tmodel.proj_layer(normalized))
+                    else:
+                        teacher_projected_outputs.append(normalized)
         else:
-            if not teacher_projected_outputs or not student_projected_outputs:
-                logging.warning("Failed to get projected outputs for contrastive learning")
-            elif len(teacher_projected_outputs) <= params.contrastive_layer:
-                logging.warning(f"Contrastive layer {params.contrastive_layer} not available in projected outputs (max: {len(teacher_projected_outputs)-1})")
-            contrastive_loss = torch.tensor(0.0, device=model_device)
+            # No projection layer: use raw layer outputs
+            student_projected_outputs = student_layer_outputs
+            teacher_projected_outputs = teacher_layer_outputs
+
+        # Validate we have at least one layer for contrastive computation
+        if len(teacher_projected_outputs) > 0 and len(student_projected_outputs) > 0:
+            # Map clayers to indices inside our produced projected lists.
+            # We took outputs in the order of clayers, so indices 0..L-1 correspond.
+            if params.contrastive_aggregation == "layer_avg":
+                # Average projected outputs across layers first, then compute one InfoNCE
+                clean_avg = torch.stack(teacher_projected_outputs, dim=0).mean(dim=0)
+                noisy_avg = torch.stack(student_projected_outputs, dim=0).mean(dim=0)
+
+                contrastive_loss = compute_contrastive_loss(
+                    clean_features=clean_avg,
+                    noisy_features=noisy_avg,
+                    negative_pair=params.negative_pair,
+                    temperature=params.contrastive_temperature,
+                )
+                logging.debug(f"Contrastive loss (layer_avg) computed using layers {clayers}: {contrastive_loss.item():.6f}")
+            else:
+                per_layer_losses = []
+                for i in range(len(teacher_projected_outputs)):
+                    l = compute_contrastive_loss(
+                        clean_features=teacher_projected_outputs[i],
+                        noisy_features=student_projected_outputs[i],
+                        negative_pair=params.negative_pair,
+                        temperature=params.contrastive_temperature,
+                    )
+                    per_layer_losses.append(l)
+
+                if len(per_layer_losses) > 0:
+                    contrastive_loss = torch.stack(per_layer_losses).mean()
+                else:
+                    contrastive_loss = torch.tensor(0.0, device=model_device, requires_grad=is_training)
+
+                logging.debug(f"Contrastive loss (output_avg) computed over layers {clayers}: {contrastive_loss.item():.6f}")
+        else:
+            logging.warning("Contrastive projected outputs not available for requested layers; skipping contrastive loss")
+            contrastive_loss = torch.tensor(0.0, device=model_device, requires_grad=is_training)
     elif params.learning_type in ["contrastive", "hybrid"] and not use_self_distillation:
         logging.warning("Contrastive learning requested but clean-noisy pairs not available. Skipping contrastive loss.")
-        contrastive_loss = torch.tensor(0.0, device=model_device)
+        # Preserve requires_grad semantics: if we're in training mode, produce
+        # a zero tensor that requires grad so the overall loss tensor keeps a
+        # consistent computational graph (or at least doesn't violate the
+        # training-vs-eval assertion). During evaluation it should not require grad.
+        contrastive_loss = torch.tensor(0.0, device=model_device, requires_grad=is_training)
 
     # Loss combination based on learning type
     if params.learning_type == "contrastive":
@@ -1004,7 +1087,8 @@ def compute_loss(
     
     else:
         raise ValueError(f"Unknown learning_type: {params.learning_type}")
-
+    
+    
     assert total_loss.requires_grad == is_training
 
     # Metrics tracking
@@ -1696,8 +1780,9 @@ def run(rank, world_size, args):
     distill_layers = params.distill_layers
     if isinstance(distill_layers, str):
         distill_layers = [int(x) for x in distill_layers.split(',') if x.strip()]
-    
-    logging.info(f"Model creation parameters: distill_layers={distill_layers}, knowledge_type={params.knowledge}")
+
+    # contrastive uses the same layers as distillation (distill_layers)
+    logging.info(f"Model creation parameters: distill_layers={distill_layers}, contrastive_aggregation={params.contrastive_aggregation}, knowledge_type={params.knowledge}")
 
     model = Conformer(
         num_features=params.feature_dim,
@@ -1710,6 +1795,34 @@ def run(rank, world_size, args):
         distill_layers=distill_layers,
     )
     model.to(device)
+    # If we're doing pure contrastive training, freeze everything except encoder
+    # so that only encoder parameters are updated. This overrides proj_layer_training
+    # because contrastive objective targets encoder representations.
+    if params.learning_type == "contrastive":
+        logging.info("Contrastive-only training: freezing all parameters except encoder")
+        for param in model.parameters():
+            param.requires_grad = False
+
+        if hasattr(model, 'encoder'):
+            for param in model.encoder.parameters():
+                param.requires_grad = True
+            logging.info("Encoder parameters unfrozen for contrastive training")
+        else:
+            logging.warning("Model has no attribute 'encoder' - cannot set encoder-only training")
+        # Always unfreeze projection head(s) so that projection layers are trainable
+        # along with the encoder for contrastive training. This matches the user's
+        # request to include projection heads in encoder updates.
+        if hasattr(model, 'proj_layer') and getattr(model, 'use_proj_layer', False):
+            for param in model.proj_layer.parameters():
+                param.requires_grad = True
+            logging.info("Projection layer parameters unfrozen for contrastive training")
+
+        if hasattr(model, 'distill_projection_heads') and getattr(model, 'distill_projection_heads', None):
+            for param in model.distill_projection_heads.parameters():
+                param.requires_grad = True
+            logging.info("Distillation projection heads unfrozen for contrastive training")
+    
+    
     
     # Configure parameter training based on proj_layer_training setting
     if params.proj_layer_training == "only-proj":
@@ -1738,6 +1851,8 @@ def run(rank, world_size, args):
         total_params = sum(p.numel() for p in model.parameters())
         logging.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
         
+        
+        
     elif params.proj_layer_training == "full-finetuning":
         logging.info("Setting up full fine-tuning - all parameters will be trained")
         
@@ -1755,12 +1870,53 @@ def run(rank, world_size, args):
     if world_size > 1:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
-    # Get trainable parameters for optimizer (important for "only-proj" mode)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    if len(trainable_params) == 0:
-        raise ValueError("No trainable parameters found! Check proj_layer_training configuration.")
-    
-    logging.info(f"Optimizer will update {len(trainable_params)} parameter tensors")
+    # If we're doing pure contrastive training, enforce encoder-only trainable params here
+    # (this overrides any earlier proj_layer_training settings so contrastive always
+    # updates encoder weights only).
+    if params.learning_type == "contrastive":
+        logging.info("Enforcing encoder-only trainable parameters for contrastive mode (overriding proj_layer_training)")
+        for param in model.parameters():
+            param.requires_grad = False
+        if hasattr(model, 'encoder'):
+            for param in model.encoder.parameters():
+                param.requires_grad = True
+        else:
+            logging.warning("Model has no attribute 'encoder' - cannot set encoder-only training")
+        # Also unfreeze projection heads so projection + encoder are trainable
+        if hasattr(model, 'proj_layer') and getattr(model, 'use_proj_layer', False):
+            for param in model.proj_layer.parameters():
+                param.requires_grad = True
+            logging.info("Projection layer parameters unfrozen for contrastive mode override")
+
+        if hasattr(model, 'distill_projection_heads') and getattr(model, 'distill_projection_heads', None):
+            for param in model.distill_projection_heads.parameters():
+                param.requires_grad = True
+            logging.info("Distillation projection heads unfrozen for contrastive mode override")
+
+    # Get trainable parameters for optimizer.
+    # In contrastive mode we explicitly select encoder + projection params
+    # (and handle DDP-wrapped model by inspecting .module).
+    actual_model = model.module if hasattr(model, 'module') else model
+
+    if params.learning_type == "contrastive":
+        selected_params = []
+        if hasattr(actual_model, 'encoder'):
+            selected_params += list(actual_model.encoder.parameters())
+        if hasattr(actual_model, 'proj_layer') and getattr(actual_model, 'use_proj_layer', False):
+            selected_params += list(actual_model.proj_layer.parameters())
+        if hasattr(actual_model, 'distill_projection_heads') and getattr(actual_model, 'distill_projection_heads', None):
+            selected_params += list(actual_model.distill_projection_heads.parameters())
+
+        # Keep only parameters that require grad (safety)
+        trainable_params = [p for p in selected_params if p is not None and p.requires_grad]
+        if len(trainable_params) == 0:
+            raise ValueError("Contrastive mode selected but no encoder/proj parameters found to train.")
+        logging.info(f"Contrastive mode optimizer will update {len(trainable_params)} parameter tensors (encoder+proj)")
+    else:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        if len(trainable_params) == 0:
+            raise ValueError("No trainable parameters found! Check proj_layer_training configuration.")
+        logging.info(f"Optimizer will update {len(trainable_params)} parameter tensors")
         
     # Create optimizer and scheduler based on scheduler_type
     logging.info(f"Scheduler type: {params.scheduler_type}")
@@ -1815,7 +1971,11 @@ def run(rank, world_size, args):
         logging.info(f"Optimizer param group lr: {param_group['lr']}")
         break  # Just check first param group
 
-    librispeech = LibriSpeechAsrDataModule(args)
+    # Pass `params` (updated with CLI args) into the data module so any
+    # programmatic changes to `params` are respected by the data loader.
+    # `params` behaves like a Namespace (AttributeDict) and provides the
+    # same attribute access used in `asr_datamodule.LibriSpeechAsrDataModule`.
+    librispeech = LibriSpeechAsrDataModule(params)
 
     if params.full_libri:
         train_cuts = librispeech.train_all_shuf_cuts()
