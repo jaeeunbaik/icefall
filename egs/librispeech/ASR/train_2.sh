@@ -11,7 +11,6 @@ set -euo pipefail
 enable_spec_aug=true          # SpecAugment (frequency/time masking)
 enable_musan=true             # MUSAN noise augmentation
 enable_cutmix=false 
-enable_cutmix=false 
 enable_concatenate=false   
 
 # Training parameters
