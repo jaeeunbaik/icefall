@@ -9,10 +9,7 @@ set -euo pipefail
 # Data Augmentation Controls (modify these as needed)
 enable_spec_aug=true          # SpecAugment (frequency/time masking)
 enable_musan=true             # MUSAN noise augmentation
-<<<<<<< HEAD
-=======
 enable_cutmix=false 
->>>>>>> 6a6360128f84b83d0ab246a237e253e94e8b30c5
 enable_concatenate=false   
 
 # Training parameters
@@ -126,11 +123,7 @@ CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_proj/train.py \
     --spec-aug-time-warp-factor $spec_aug_time_warp_factor \
     --spec-aug-num-frame-masks $spec_aug_num_frame_masks \
     --spec-aug-features-mask-size $spec_aug_features_mask_size \
-<<<<<<< HEAD
-    --spec-aug-num-feature-masks $spec_aug_num_feature_masks \
-=======
     --spec-aug-num-features-masks $spec_aug_num_feature_masks \
->>>>>>> 6a6360128f84b83d0ab246a237e253e94e8b30c5
     --spec-aug-frames-mask-size $spec_aug_frames_mask_size \
     --musan-ratio $musan_ratio \
     --snr-range $snr_range \
@@ -139,10 +132,7 @@ CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_proj/train.py \
     --return-cuts $return_cuts \
     --on-the-fly-feats $on_the_fly_feats \
     --bucketing-sampler false \
-<<<<<<< HEAD
-=======
     --concatenate-cuts $enable_concatenate \
->>>>>>> 6a6360128f84b83d0ab246a237e253e94e8b30c5
     --duration-factor 1.0 \
     --drop-last true \
     --shuffle true \
