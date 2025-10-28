@@ -265,7 +265,7 @@ class LibriSpeechAsrDataModule:
             "(you might want to increase it for larger datasets).",
         )
         group.add_argument(
-            "--concatenate-cuts",
+            "--enable-concatenate",
             type=str2bool,
             default=False,
             help="When enabled, utterances (cuts) will be concatenated "
@@ -431,7 +431,7 @@ class LibriSpeechAsrDataModule:
         else:
             logging.info("Disable MUSAN")
 
-        if self.args.concatenate_cuts:
+        if self.args.enable_concatenate:
             logging.info(
                 f"Using cut concatenation with duration factor "
                 f"{self.args.duration_factor} and gap {self.args.gap}."
@@ -574,7 +574,7 @@ class LibriSpeechAsrDataModule:
 
     def valid_dataloaders(self, cuts_valid: CutSet) -> DataLoader:
         transforms = []
-        if self.args.concatenate_cuts:
+        if self.args.enable_concatenate:
             transforms = [
                 CutConcatenate(
                     duration_factor=self.args.duration_factor, gap=self.args.gap

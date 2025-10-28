@@ -84,7 +84,7 @@ else
     export PYTHONPATH="${PYTHONPATH}:/tmp/icefall"
 fi
 
-CUDA_VISIBLE_DEVICES=1 python3 ./conformer_ctc_sd_proj/train.py \
+CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_proj/train.py \
     --exp-dir $exp_dir \
     --master-port $master_port \
     --sanity-check $sanity_check \

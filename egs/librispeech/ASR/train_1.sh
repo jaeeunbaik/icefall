@@ -2,7 +2,6 @@
 
 # train_sd.sh - LibriSpeech ASR Self-Distillation Training Script
 # Usage: bash train_sd.sh
-
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 
 set -euo pipefail
@@ -10,7 +9,6 @@ set -euo pipefail
 # Data Augmentation Controls (modify these as needed)
 enable_spec_aug=true          # SpecAugment (frequency/time masking)
 enable_musan=true             # MUSAN noise augmentation
-enable_cutmix=false 
 enable_cutmix=false 
 enable_concatenate=false   
 
@@ -43,7 +41,6 @@ base_lr=5e-5                 # Base learning rate for plateau/constant scheduler
 scheduler_patience=3          # Patience for ReduceLROnPlateau
 scheduler_factor=0.5          # Factor for ReduceLROnPlateau (0.5 = 50% reduction)
 min_lr=5e-6          
-min_lr=5e-6          
 
 # Validation decoding settings
 validation_decoding_method="greedy"    # "greedy" or "beam" - use greedy for faster validation
@@ -53,27 +50,27 @@ validation_skip_wer=false              # Skip WER computation for even faster va
 
 # Distillation Hyperparameters
 enable_self_distillation=true
-distill_layers=3,16,13
+distill_layers=5,11,17
 distill_loss_type="kl"         # mse, cosine, kl
-alpha=50000000000
+alpha=0
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 knowledge="attention-map"      # "encoder-output", "attention-map"
 distill_temperature=4.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_kl_layer3,6,13
+clean_ratio=0.8
+exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_ft_high-clean_normal-aug
 
 #
-spec_aug_time_warp_factor=0               # default: 100
-spec_aug_num_frame_masks=6                # default: 2  
-spec_aug_features_mask_size=40            # default: 27
-spec_aug_num_feature_masks=6              # default: 2
-spec_aug_frames_mask_size=150             # default: 100
-musan_ratio=0.9                           # default: 0.5
-snr_range=0,5
-
+spec_aug_time_warp_factor=0              # default: 100
+spec_aug_num_frame_masks=2                # default: 2  
+spec_aug_features_mask_size=27            # default: 27
+spec_aug_num_feature_masks=2              # default: 2
+spec_aug_frames_mask_size=100             # default: 100
+musan_ratio=0.5                           # default: 0.5
+snr_range=5,10
 #
-use_proj_layer=True
+use_proj_layer=False
 proj_layer_training="full-finetuning"       # full-finetuning, only-proj
 return_cuts=False
 on_the_fly_feats=True
@@ -85,42 +82,36 @@ else
     export PYTHONPATH="${PYTHONPATH}:/tmp/icefall"
 fi
 
-CUDA_VISIBLE_DEVICES=1 python3 ./conformer_ctc_sd_proj/train.py \
-    --exp-dir $exp_dir \
-    --master-port $master_port \
-    --sanity-check $sanity_check \
-    --world-size $world_size \
-    --warm-step $warm_step \
-    --start-epoch $start_epoch \
-    --resume-from $resume_from \
-    --att-rate $att_rate \
-    --num-decoder-layers $num_decoder_layers \
-    --num-workers $num_workers \
+CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_proj/train.py \
     --enable-spec-aug $enable_spec_aug \
     --enable-musan $enable_musan \
+    --enable-concatenate $enable_concatenate \
+    --world-size $world_size \
     --max-duration $max_duration \
     --valid-max-duration $valid_max_duration \
     --num-buckets $num_buckets \
-    --bucketing-sampler false \
-    --concatenate-cuts $enable_concatenate \
-    --duration-factor 1.0 \
-    --drop-last true \
-    --shuffle true \
+    --num-workers $num_workers \
+    --warm-step $warm_step \
     --lang-dir $lang_dir \
     --method $method \
+    --att-rate $att_rate \
+    --num-decoder-layers $num_decoder_layers \
+    --start-epoch $start_epoch \
+    --master-port $master_port \
+    --sanity-check $sanity_check \
+    --resume-from $resume_from \
+    --enable-validation $enable_validation \
+    --valid-interval $valid_interval \
     --scheduler-type $scheduler_type \
     --base-lr $base_lr \
     --scheduler-patience $scheduler_patience \
     --scheduler-factor $scheduler_factor \
     --min-lr $min_lr \
-    --enable-validation $enable_validation \
-    --valid-interval $valid_interval \
     --validation-decoding-method $validation_decoding_method \
     --validation-search-beam $validation_search_beam \
     --validation-output-beam $validation_output_beam \
     --validation-skip-wer $validation_skip_wer \
     --enable-self-distillation $enable_self_distillation \
-    --distill-layers $distill_layers \
     --distill-loss-type $distill_loss_type \
     --alpha $alpha \
     --distill-aggregation $distill_aggregation \
@@ -128,15 +119,20 @@ CUDA_VISIBLE_DEVICES=1 python3 ./conformer_ctc_sd_proj/train.py \
     --distill-temperature $distill_temperature \
     --ema-decay $ema_decay \
     --ema-start-step $ema_start_step \
+    --exp-dir $exp_dir \
+    --spec-aug-time-warp-factor $spec_aug_time_warp_factor \
+    --spec-aug-num-frame-masks $spec_aug_num_frame_masks \
+    --spec-aug-features-mask-size $spec_aug_features_mask_size \
+    --spec-aug-num-feature-masks $spec_aug_num_feature_masks \
+    --spec-aug-frames-mask-size $spec_aug_frames_mask_size \
+    --musan-ratio $musan_ratio \
+    --snr-range $snr_range \
     --use-proj-layer $use_proj_layer \
     --proj-layer-training $proj_layer_training \
     --return-cuts $return_cuts \
     --on-the-fly-feats $on_the_fly_feats \
-    --spec-aug-time-warp-factor $spec_aug_time_warp_factor \
-    --spec-aug-num-frame-masks $spec_aug_num_frame_masks \
-    --spec-aug-features-mask-size $spec_aug_feature_mask_size \
-    --spec-aug-num-feature-masks $spec_aug_num_features_masks \
-    --spec-aug-frames-mask-size $spec_aug_frames_mask_size \
-    --musan-ratio $musan_ratio \
-    --snr-range $snr_range
-
+    --bucketing-sampler false \
+    --duration-factor 1.0 \
+    --drop-last true \
+    --shuffle true \
+    
