@@ -24,6 +24,5 @@ CUDA_VISIBLE_DEVICES=2 python ./conformer_ctc_sd_proj/decode.py \
     --max-duration 20 \
     --epoch 2 \
     --avg 3 \
-    --exp-dir conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_kl_layer4,9,13/models \
-    --include-proj-layer True \
-    --distill-layers 4,9,13
+    --exp-dir conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_ft_high-clean_strong-aug/models \
+    --include-proj-layer False \
