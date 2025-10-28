@@ -54,7 +54,7 @@ validation_skip_wer=false              # Skip WER computation for even faster va
 enable_self_distillation=true
 distill_layers=3,6,18
 distill_loss_type="kl"         # mse, cosine, kl
-alpha=500000000000
+alpha=50000000000
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 knowledge="attention-map"      # "encoder-output", "attention-map"
 distill_temperature=4.0
@@ -63,7 +63,7 @@ ema_start_step=1000
 exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_kl_layer3,6,18
 
 #
-spec_aug_time_warp_factor=100              # default: 100
+spec_aug_time_warp_factor=0               # default: 100
 spec_aug_num_frame_masks=6                # default: 2  
 spec_aug_features_mask_size=40            # default: 27
 spec_aug_num_feature_masks=6              # default: 2
@@ -84,7 +84,7 @@ else
     export PYTHONPATH="${PYTHONPATH}:/tmp/icefall"
 fi
 
-CUDA_VISIBLE_DEVICES=3 python3 ./conformer_ctc_sd_proj/train.py \
+CUDA_VISIBLE_DEVICES=1 python3 ./conformer_ctc_sd_proj/train.py \
     --exp-dir $exp_dir \
     --master-port $master_port \
     --sanity-check $sanity_check \
@@ -131,3 +131,11 @@ CUDA_VISIBLE_DEVICES=3 python3 ./conformer_ctc_sd_proj/train.py \
     --proj-layer-training $proj_layer_training \
     --return-cuts $return_cuts \
     --on-the-fly-feats $on_the_fly_feats \
+    --spec-aug-time-warp-factor $spec_aug_time_warp_factor \
+    --spec-aug-num-frame-masks $spec_aug_num_frame_masks \
+    --spec-aug-features-mask-size $spec_aug_feature_mask_size \
+    --spec-aug-num-feature-masks $spec_aug_num_features_masks \
+    --spec-aug-frames-mask-size $spec_aug_frames_mask_size \
+    --musan-ratio $musan_ratio \
+    --snr-range $snr_range
+
