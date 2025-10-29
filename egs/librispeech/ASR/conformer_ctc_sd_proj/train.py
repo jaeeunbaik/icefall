@@ -44,6 +44,7 @@ import sentencepiece as spm
 from asr_datamodule import LibriSpeechAsrDataModule
 from conformer import Conformer
 from ema_teacher import EMATeacher
+from k_means_clustering import PrototypeKMeansManager
 from lhotse.cut import Cut
 from lhotse.utils import fix_random_seed
 from torch import Tensor
@@ -278,15 +279,6 @@ def get_parser():
              "'output_avg' computes loss for each layer and averages them.",
     )
     
-    parser.add_argument(
-        "--knowledge",
-        type=str,
-        default="encoder-output",
-        choices=["encoder-output", "attention-map"],
-        help="Type of knowledge to use for self-distillation: "
-             "'encoder-output' uses intermediate encoder layer outputs, "
-             "'attention-map' uses attention weights from self-attention layers.",
-    )
     
     parser.add_argument(
         "--distill-temperature",
@@ -379,18 +371,41 @@ def get_parser():
     )
     
     parser.add_argument(
-        "--proj-layer-training",
-        type=str,
-        default="full-finetuning",
-        choices=["full-finetuning", "only-proj"],
-        help="Training method for self distillation: 'full-finetuning' for fine-tuning all parameters, 'only-proj' for training only proj layer, else freezed.",
-    )
-
-    parser.add_argument(
         "--learning-type",
         type=str,
         default="encoder-only",
-        choices=["encoder-only", ""]
+        choices=["encoder-only", "hybrid", "asr"],
+        help="""Training method, encoder-only for training only encoder, hybrid when loss is weighted sum of self-distillation and asr
+        asr when training loss is only composed of asr loss
+        """
+    )
+    
+    parser.add_argument(
+        "--clean-ratio",
+        type=float,
+        default=0.3,
+    )
+    
+    # Prototype-based KL divergence arguments
+    parser.add_argument(
+        "--prototype-dir",
+        type=str,
+        default="./prototypes",
+        help="Directory to save/load prototypes. If directory doesn't exist, prototypes will be initialized.",
+    )
+    
+    parser.add_argument(
+        "--num-prototypes",
+        type=int,
+        default=256,
+        help="Number of prototypes per layer for KL-based distillation (K value for K-means)",
+    )
+    
+    parser.add_argument(
+        "--prototype-samples",
+        type=int,
+        default=100000,
+        help="Number of feature samples per layer for prototype initialization using K-means",
     )
     
     return parser
@@ -525,7 +540,7 @@ def load_checkpoint_if_available(
     models_dir = params.exp_dir / "models"
 
     # If resume-from is set, use that path directly
-    resume_path = getattr(params, "resume_from", None)
+    resume_path = params.resume_from
     if resume_path:
         filename = Path(resume_path)
         if not filename.exists():
@@ -672,6 +687,7 @@ def compute_loss(
     graph_compiler: BpeCtcTrainingGraphCompiler,
     is_training: bool,
     ema_teacher: Optional[EMATeacher] = None,
+    prototype_manager: Optional[PrototypeKMeansManager] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute CTC loss with optional self-distillation.
@@ -692,7 +708,7 @@ def compute_loss(
     device = graph_compiler.device
     
     # Handle clean-noisy batch structure for self-distillation
-    if 'clean' in batch and 'noisy' in batch and params.enable_self_distillation:
+    if 'clean' in batch and 'noisy' in batch and params.learning_type in ["encoder-only", "hybrid"]:
         # Self-distillation mode with clean-noisy samples
         clean_feature = batch['clean']['inputs']
         noisy_feature = batch['noisy']['inputs']
@@ -702,11 +718,9 @@ def compute_loss(
         # Use noisy samples as primary for CTC loss computation
         feature = noisy_feature
         supervisions = noisy_supervisions
-        
-        # Note: We'll move to the correct device later after getting model device
-        use_self_distillation = True
         # Clean-noisy pairs are being used for self-distillation
-    else:
+        
+    elif params.learning_type == "asr":
         # Normal mode or self-distillation disabled
         feature = batch["inputs"]
         supervisions = batch["supervisions"]
@@ -715,7 +729,6 @@ def compute_loss(
         clean_feature = None
         noisy_feature = None
         clean_supervisions = None
-        use_self_distillation = False
     
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
@@ -752,7 +765,8 @@ def compute_loss(
         # Self-distillation computation
         distillation_loss = torch.tensor(0.0, device=model_device)
         
-        if use_self_distillation and params.enable_self_distillation and clean_feature is not None:
+        
+        if params.learning_type in ["encoder-only", "hybrid"] and clean_feature is not None:
             # Log only occasionally to reduce spam
             if params.batch_idx_train % 1000 == 0:
                 logging.info(f"Self-distillation active: ema_teacher={ema_teacher is not None}, step={params.batch_idx_train}")
@@ -778,87 +792,42 @@ def compute_loss(
                 distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
             except:
                 distill_layers = [int(params.distill_layers)]
-            
-            if params.knowledge == "encoder-output":
-                # Extract encoder outputs for distillation with projection layers
-                if params.use_proj_layer and len(distill_layers) > 0:
-                    # Use get_intermediate_outputs for projection-applied distillation layers
-                    if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-                        teacher_model = ema_teacher.get_teacher_model()
-                        with torch.no_grad():
-                            teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
-                    else:
-                        with torch.no_grad():
-                            teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
-                    
-                    # Get student projected outputs
-                    student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
-                    
-                    if teacher_projected_outputs and student_projected_outputs:
-                        from conformer import compute_multi_layer_distillation_loss
-                        distillation_loss = compute_multi_layer_distillation_loss(
-                            teacher_knowledge=teacher_projected_outputs,
-                            student_knowledge=student_projected_outputs,
-                            knowledge_lens=output_lens,
-                            layer_indices=list(range(len(distill_layers))),  # Use sequential indices since we already filtered layers
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                            aggregation=params.distill_aggregation,
-                        )
-                    else:
-                        logging.warning("Failed to get projected outputs for distillation")
-                        distillation_loss = torch.tensor(0.0, device=model_device)
                 
-                elif hiddens is not None and t_hidden is not None:
-                    # Fallback to original method when projection is disabled
-                    # Import the multi-layer distillation function
+            # Extract encoder outputs for distillation with projection layers
+            if params.use_proj_layer and len(distill_layers) > 0:
+                # Use get_intermediate_outputs for projection-applied distillation layers
+                if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+                    teacher_model = ema_teacher.get_teacher_model()
+                    with torch.no_grad():
+                        teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
+                else:
+                    with torch.no_grad():
+                        teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
+                
+                # Get student projected outputs
+                student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
+                
+                if teacher_projected_outputs and student_projected_outputs:
                     from conformer import compute_multi_layer_distillation_loss
-                    
-                    if len(distill_layers) == 1:
-                        from conformer import compute_distillation_loss
-                        distillation_loss = compute_distillation_loss(
-                            teacher_knowledge=t_output,
-                            student_knowledge=nnet_output,
-                            knowledge_lens=output_lens,
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                        )
-                    else:
-                        from conformer import compute_multi_layer_distillation_loss
-                        distillation_loss = compute_multi_layer_distillation_loss(
-                            teacher_knowledge=t_hidden,
-                            student_knowledge=hiddens,
-                            knowledge_lens=output_lens,
-                            layer_indices=distill_layers,
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                            aggregation=params.distill_aggregation,
-                        )
-                    
-            elif params.knowledge == "attention-map":
-                # Extract attention maps for distillation
-                if att_maps is not None and t_maps is not None:
-                    
-                    # Import the multi-layer distillation function
-                    from conformer import compute_multi_layer_distillation_loss
-                    
                     distillation_loss = compute_multi_layer_distillation_loss(
-                        teacher_knowledge=t_maps,
-                        student_knowledge=att_maps,
+                        teacher_knowledge=teacher_projected_outputs,
+                        student_knowledge=student_projected_outputs,
                         knowledge_lens=output_lens,
-                        layer_indices=distill_layers,
-                        loss_type="kl",  # Always use KL divergence for attention maps
-                        knowledge_type="attention-map",
+                        layer_indices=list(range(len(distill_layers))),  # Use sequential indices since we already filtered layers
+                        loss_type=params.distill_loss_type,
                         aggregation=params.distill_aggregation,
                         temperature=params.distill_temperature,
+                        prototype_manager=prototype_manager,
+                        target_layers=distill_layers,  # Pass actual layer indices for prototype lookup
                     )
-                    logging.debug(f"Attention-map distillation loss computed: {distillation_loss.item():.6f}")
                 else:
-                    logging.warning("Attention maps not found in model output. Distillation disabled for this batch.")
+                    logging.warning("Failed to get projected outputs for distillation")
                     distillation_loss = torch.tensor(0.0, device=model_device)
+                
+
         else:
-            if not use_self_distillation:
-                logging.debug("Self-distillation disabled (use_self_distillation=False)")
+            if params.learning-type == "asr":
+                logging.debug("Self-distillation disabled (learning-type=asr)")
             elif clean_feature is None:
                 logging.warning("Clean feature is None, skipping self-distillation")
 
@@ -868,11 +837,9 @@ def compute_loss(
     s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
     if t_output is not None:
         t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
-        ctc_loss = 0.1 * t_ctc_loss + 0.9 * s_ctc_loss
+        ctc_loss = params.clean_ratio * t_ctc_loss + (1 - params.clean_ratio) * s_ctc_loss
     else:
         ctc_loss = s_ctc_loss
-
-
 
     # Attention loss computation (if applicable)
     if params.att_rate != 0.0:
@@ -893,12 +860,22 @@ def compute_loss(
         total_loss = ctc_loss
 
     # Add self-distillation loss with proper scale matching
-    if use_self_distillation and distillation_loss.item() > 0:
+    if params.learning_type == "encoder-only":
+        total_loss = distillation_loss
+        logging.debug(f"encoder only trainig"
+                      f"distill_loss={distillation_loss:.4f}")
+        
+    elif params.learning_type == "hybrid" and distillation_loss.item() > 0:
         # With reduction='mean', CTC loss scale is more manageable
         total_loss = total_loss + params.alpha * distillation_loss
         logging.debug(f"Loss combination: ctc_loss={total_loss-params.alpha*distillation_loss:.4f}, "
                      f"distill_loss={distillation_loss:.4f}, alpha={params.alpha}, "
                      f"total_loss={total_loss:.4f}")
+    
+    elif params.learning_type == "asr":
+        logging.debug(f"Loss combination: ctc_loss={ctc_loss:.4f}, "
+                    f"att_loss={att_loss:.4f}, att_rate={params.att_rate}, "
+                    f"total_loss={total_loss:.4f}")
 
     assert total_loss.requires_grad == is_training
 
@@ -1002,6 +979,7 @@ def compute_validation_loss(
                 batch=batch,
                 graph_compiler=graph_compiler,
                 is_training=False,
+                prototype_manager=None,  # Validation doesn't need prototype manager
             )
             
             assert loss.requires_grad is False
@@ -1204,6 +1182,7 @@ def train_one_epoch(
     rank: int = 0,
     ema_teacher: Optional[EMATeacher] = None,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    prototype_manager: Optional[PrototypeKMeansManager] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1258,6 +1237,7 @@ def train_one_epoch(
             graph_compiler=graph_compiler,
             is_training=True,
             ema_teacher=ema_teacher,
+            prototype_manager=prototype_manager,
         )
         # summary stats
         tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -1463,7 +1443,7 @@ def run(rank, world_size, args):
     if isinstance(distill_layers, str):
         distill_layers = [int(x) for x in distill_layers.split(',') if x.strip()]
     
-    logging.info(f"Model creation parameters: distill_layers={distill_layers}, knowledge_type={params.knowledge}")
+    logging.info(f"Model creation parameters: distill_layers={distill_layers}")
 
     model = Conformer(
         num_features=params.feature_dim,
@@ -1494,7 +1474,7 @@ def run(rank, world_size, args):
         
     # Create optimizer and scheduler based on scheduler_type
     logging.info(f"Scheduler type: {params.scheduler_type}")
-    logging.info(f"Base LR: {getattr(params, 'base_lr', 'NOT SET')}")
+    logging.info(f"Base LR: {params.base_lr}")
     
     if params.scheduler_type == "noam":
         optimizer = Noam(
@@ -1508,7 +1488,7 @@ def run(rank, world_size, args):
         logging.info(f"Using Noam optimizer with lr_factor={params.lr_factor}")
     else:
         # Use Adam optimizer for plateau and constant schedulers
-        base_lr = getattr(params, 'base_lr', 2e-5)  # Default fallback
+        base_lr = params.base_lr  # Default fallback
         logging.info(f"Using Adam optimizer with base_lr={base_lr}")
         
         optimizer = torch.optim.Adam(
@@ -1607,6 +1587,49 @@ def run(rank, world_size, args):
             logging.warning("Starting with fresh optimizer state")
             # Continue training with fresh optimizer state
     
+    # Initialize prototype manager for KL-based distillation
+    prototype_manager = None
+    if params.learning_type in ["encoder-only", "hybrid"] and params.distill_loss_type == "kl":
+        try:
+            # Parse distillation layers
+            distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
+        except:
+            distill_layers = [int(params.distill_layers)]
+        
+        if distill_layers and rank == 0:  # Only initialize on rank 0
+            logging.info("Initializing prototype manager for KL-based distillation")
+            logging.info(f"Target layers for prototypes: {distill_layers}")
+            logging.info(f"Prototype directory: {params.prototype_dir}")
+            
+            prototype_manager = PrototypeKMeansManager(
+                target_layers=distill_layers,
+                num_prototypes=params.num_prototypes,
+                proj_dim=params.attention_dim,  # Use model's attention_dim
+                temperature=params.distill_temperature,
+                save_dir=params.prototype_dir
+            )
+            
+            # Check if prototype directory exists and has required prototype files
+            prototype_dir = Path(params.prototype_dir)
+            prototype_files_exist = all(
+                (prototype_dir / f"prototypes_layer_{layer_idx}.pt").exists() 
+                for layer_idx in distill_layers
+            )
+            
+            if not prototype_files_exist:
+                logging.info("Prototype files not found. Initializing prototypes using K-means clustering")
+                teacher_model = ema_teacher.get_teacher_model() if ema_teacher else model
+                prototype_manager.initialize_prototypes(
+                    teacher_model=teacher_model,
+                    dataloader=train_dl,
+                    num_samples_per_layer=params.prototype_samples,
+                    load_if_exists=False  # Force initialization since files don't exist
+                )
+                logging.info("Prototype initialization completed")
+            else:
+                logging.info("Prototype files found. Loading existing prototypes")
+                prototype_manager.load_prototypes(params.prototype_dir)
+                logging.info("Prototype loading completed")
 
     for epoch in range(params.start_epoch, params.num_epochs):
         fix_random_seed(params.seed + epoch)
@@ -1639,6 +1662,7 @@ def run(rank, world_size, args):
             rank=rank,
             ema_teacher=ema_teacher,
             scheduler=scheduler,
+            prototype_manager=prototype_manager,
         )
 
         save_checkpoint(
@@ -1678,6 +1702,7 @@ def scan_pessimistic_batches_for_oom(
                 batch=batch,
                 graph_compiler=graph_compiler,
                 is_training=True,
+                prototype_manager=None,  # Sanity check doesn't need prototype manager
             )
             loss.backward()
             clip_grad_norm_(model.parameters(), 5.0, 2.0)
