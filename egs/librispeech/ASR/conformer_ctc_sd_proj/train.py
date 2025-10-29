@@ -45,6 +45,7 @@ from asr_datamodule import LibriSpeechAsrDataModule
 from conformer import Conformer
 from ema_teacher import EMATeacher
 from k_means_clustering import PrototypeKMeansManager
+from k_means_clustering import PrototypeKMeansManager
 from lhotse.cut import Cut
 from lhotse.utils import fix_random_seed
 from torch import Tensor
@@ -372,7 +373,13 @@ def get_parser():
     
     parser.add_argument(
         "--learning-type",
+        "--learning-type",
         type=str,
+        default="encoder-only",
+        choices=["encoder-only", "hybrid", "asr"],
+        help="""Training method, encoder-only for training only encoder, hybrid when loss is weighted sum of self-distillation and asr
+        asr when training loss is only composed of asr loss
+        """
         default="encoder-only",
         choices=["encoder-only", "hybrid", "asr"],
         help="""Training method, encoder-only for training only encoder, hybrid when loss is weighted sum of self-distillation and asr
