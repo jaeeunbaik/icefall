@@ -106,7 +106,7 @@ def get_parser():
     parser.add_argument(
         "--num-epochs",
         type=int,
-        default=10,
+        default=5,
         help="Number of epochs to train.",
     )
 
@@ -297,6 +297,14 @@ def get_parser():
              "Higher values make attention distributions smoother.",
     )
     
+    parser.add_argument(
+        "--clean-ratio",
+        type=float,
+        default=0.1,
+        help="Clean ratio for total ctc loss, which is weighted sum of clean asr loss and noisy asr loss"
+    )
+    
+    
     # EMA Teacher Model Arguments
     parser.add_argument(
         "--ema-decay",
@@ -416,7 +424,7 @@ def get_parser():
     parser.add_argument(
         "--contrastive-aggregation",
         type=str,
-        default="layer_avg",
+        default="output_avg",
         choices=["layer_avg", "output_avg"],
         help=("How to aggregate multi-layer contrastive features: 'layer_avg' averages the "
               "projected outputs across layers and then computes one InfoNCE; 'output_avg' "
@@ -430,6 +438,29 @@ def get_parser():
         help="Temperature parameter for InfoNCE contrastive loss. "
              "Lower values (e.g., 0.07) make the model focus more on hard negatives. "
              "Higher values (e.g., 0.5) make the distribution smoother.",
+    )
+
+    parser.add_argument(
+        "--contrastive-negative-mode",
+        type=str,
+        default="k-sampled",
+        choices=["within-sample-all", "k-sampled", "local-window"],
+        help="How to select negatives for contrastive loss: within-sample-all uses all other time positions in the same sample;"
+              "k-sampled samples K negatives per anchor; local-window samples within a time window around the anchor.",
+    )
+
+    parser.add_argument(
+        "--contrastive-num-negatives",
+        type=int,
+        default=100,
+        help="Number of negatives (K) to sample per anchor when using k-sampled or local-window modes.",
+    )
+
+    parser.add_argument(
+        "--contrastive-window",
+        type=int,
+        default=5,
+        help="Window size (w) in frames on each side for local-window negative sampling (samples from [t-w, t+w] excluding t).",
     )
     
     return parser
@@ -771,8 +802,9 @@ def compute_loss(
         clean_feature = clean_feature.to(model_device)
     t_output = None
     with torch.set_grad_enabled(is_training):
-        # Forward pass through model (noisy sample)
+    # Forward pass through model (noisy sample)
         nnet_output, encoder_memory, memory_mask, hiddens, att_maps = model(feature, supervisions)
+        logging.debug(f"Student forward executed (is_training={is_training}), nnet_output shape={tuple(nnet_output.shape)}")
         
         # Get the original lengths from supervisions
         if isinstance(supervisions, dict) and 'num_frames' in supervisions:
@@ -787,137 +819,83 @@ def compute_loss(
             batch_size = nnet_output.size(1)  # N from (T, N, C)
             seq_len = nnet_output.size(0)     # T from (T, N, C) 
             output_lens = [seq_len] * batch_size
-        
-        # Self-distillation computation
+
+        # Decide which losses to compute
+        compute_ctc = params.learning_type in ["hybrid", "asr"]
+        compute_distill = params.learning_type in ["hybrid", "asr"] and use_self_distillation and (clean_feature is not None)
+        compute_contrastive = params.learning_type in ["contrastive", "hybrid"] and use_self_distillation and (clean_feature is not None)
+
+        # Prepare placeholders
         distillation_loss = torch.tensor(0.0, device=model_device)
-        
-        if use_self_distillation and params.enable_self_distillation and clean_feature is not None and params.learning_type != "contrastive":
-            # Skip self-distillation for pure contrastive learning
-            # Log only occasionally to reduce spam
+        contrastive_loss = torch.tensor(0.0, device=model_device)
+        t_output = None
+        t_hidden = None
+        t_maps = None
+
+        # If we need teacher outputs for distillation or contrastive, run
+        # the teacher forward once (EMA if available, else student model on clean)
+        if (compute_distill or compute_contrastive):
             if params.batch_idx_train % 1000 == 0:
-                logging.info(f"Self-distillation active: ema_teacher={ema_teacher is not None}, step={params.batch_idx_train}")
-            
-            # Use EMA teacher model if available, otherwise use the same model with clean samples
+                logging.info(f"Teacher forward required: distill={compute_distill}, contrastive={compute_contrastive}")
             if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
                 teacher_model = ema_teacher.get_teacher_model()
                 with torch.no_grad():
-                    t_output, _, _, t_hidden, t_maps = teacher_model(clean_feature, clean_supervisions)
-                if params.batch_idx_train % 1000 == 0:
-                    logging.info(f"Using EMA teacher model for distillation (step {params.batch_idx_train})")
+                    t_output, _tmem, _tmask, t_hidden, t_maps = teacher_model(clean_feature, clean_supervisions)
+                logging.debug(f"Teacher forward executed using EMA teacher (no_grad), t_output shape={(None if t_output is None else tuple(t_output.shape))}")
             else:
-                # 학습 초반부에 EMA 모델 없으면 student 모델로 계산
                 with torch.no_grad():
-                    t_output, _, _, t_hidden, t_maps = model(clean_feature, clean_supervisions)
-                if ema_teacher is not None and params.batch_idx_train % 1000 == 0:
-                    logging.info(f"EMA teacher exists but step {params.batch_idx_train} < start_step {params.ema_start_step}, using same model")
-                elif ema_teacher is None and params.batch_idx_train % 1000 == 0:
-                    logging.info(f"No EMA teacher, using same model with clean samples as teacher")
-            
-            # Parse distillation layers from comma-separated string
+                    t_output, _tmem, _tmask, t_hidden, t_maps = model(clean_feature, clean_supervisions)
+                logging.debug(f"Teacher forward executed using student model (no_grad), t_output shape={(None if t_output is None else tuple(t_output.shape))}")
+
+        # Parse distillation layers
+        try:
+            distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
+        except Exception:
+            distill_layers = [int(params.distill_layers)]
+
+        # If projection heads are used, compute projected intermediate outputs once
+        cached_student_projected_outputs = None
+        cached_teacher_projected_outputs = None
+        if params.use_proj_layer and len(distill_layers) > 0:
             try:
-                distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
-            except:
-                distill_layers = [int(params.distill_layers)]
-            
-            if params.knowledge == "encoder-output":
-                # Extract encoder outputs for distillation with projection layers
-                if params.use_proj_layer and len(distill_layers) > 0:
-                    # Use get_intermediate_outputs for projection-applied distillation layers
+                cached_student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
+            except Exception:
+                cached_student_projected_outputs = None
+            if compute_distill or compute_contrastive:
+                try:
                     if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
                         teacher_model = ema_teacher.get_teacher_model()
                         with torch.no_grad():
-                            teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
+                            cached_teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
                     else:
                         with torch.no_grad():
-                            teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
-                    
-                    # Get student projected outputs
-                    student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
-                    
-                    if teacher_projected_outputs and student_projected_outputs:
-                        from conformer import compute_multi_layer_distillation_loss
-                        distillation_loss = compute_multi_layer_distillation_loss(
-                            teacher_knowledge=teacher_projected_outputs,
-                            student_knowledge=student_projected_outputs,
-                            knowledge_lens=output_lens,
-                            layer_indices=list(range(len(distill_layers))),  # Use sequential indices since we already filtered layers
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                            aggregation=params.distill_aggregation,
-                        )
-                    else:
-                        logging.warning("Failed to get projected outputs for distillation")
-                        distillation_loss = torch.tensor(0.0, device=model_device)
-                
-                elif hiddens is not None and t_hidden is not None:
-                    # Fallback to original method when projection is disabled
-                    # Import the multi-layer distillation function
-                    from conformer import compute_multi_layer_distillation_loss
-                    
-                    if len(distill_layers) == 1:
-                        from conformer import compute_distillation_loss
-                        distillation_loss = compute_distillation_loss(
-                            teacher_knowledge=t_output,
-                            student_knowledge=nnet_output,
-                            knowledge_lens=output_lens,
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                        )
-                    else:
-                        from conformer import compute_multi_layer_distillation_loss
-                        distillation_loss = compute_multi_layer_distillation_loss(
-                            teacher_knowledge=t_hidden,
-                            student_knowledge=hiddens,
-                            knowledge_lens=output_lens,
-                            layer_indices=distill_layers,
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                            aggregation=params.distill_aggregation,
-                        )
-                    
-            elif params.knowledge == "attention-map":
-                # Extract attention maps for distillation
-                if att_maps is not None and t_maps is not None:
-                    
-                    # Import the multi-layer distillation function
-                    from conformer import compute_multi_layer_distillation_loss
-                    
-                    distillation_loss = compute_multi_layer_distillation_loss(
-                        teacher_knowledge=t_maps,
-                        student_knowledge=att_maps,
-                        knowledge_lens=output_lens,
-                        layer_indices=distill_layers,
-                        loss_type="kl",  # Always use KL divergence for attention maps
-                        knowledge_type="attention-map",
-                        aggregation=params.distill_aggregation,
-                        temperature=params.distill_temperature,
-                    )
-                    logging.debug(f"Attention-map distillation loss computed: {distillation_loss.item():.6f}")
-                else:
-                    logging.warning("Attention maps not found in model output. Distillation disabled for this batch.")
-                    distillation_loss = torch.tensor(0.0, device=model_device)
-        else:
-            if not use_self_distillation:
-                logging.debug("Self-distillation disabled (use_self_distillation=False)")
-            elif clean_feature is None:
-                logging.warning("Clean feature is None, skipping self-distillation")
-            elif params.learning_type == "contrastive":
-                logging.debug("Self-distillation disabled for pure contrastive learning")
+                            cached_teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
+                except Exception:
+                    cached_teacher_projected_outputs = None
 
-    # NOTE: We need `encode_supervisions` to sort sequences with
-    # different duration in decreasing order, required by
-    # `k2.intersect_dense` called in `k2.ctc_loss`
-    s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
-    if t_output is not None:
-        t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
-        ctc_loss = 0.1 * t_ctc_loss + 0.9 * s_ctc_loss
+    # Prepare supervision_segments for metrics (cheap). We only run full
+    # CTC computation when not in pure contrastive mode to save time.
+    supervision_segments, _texts = encode_supervisions(
+        supervisions, subsampling_factor=params.subsampling_factor
+    )
+
+    if params.learning_type == "contrastive":
+        # Skip full CTC computation in pure contrastive mode for efficiency.
+        ctc_loss = torch.tensor(0.0, device=model_device)
     else:
-        ctc_loss = s_ctc_loss
+        # Compute full CTC loss for hybrid / asr modes
+        s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
+        if t_output is not None:
+            t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
+            ctc_loss = params.clean_ratio * t_ctc_loss + (1 - params.clean_ratio) * s_ctc_loss
+        else:
+            ctc_loss = s_ctc_loss
 
 
 
-    # Attention loss computation (if applicable)
-    if params.att_rate != 0.0:
+    # Attention loss computation (if applicable). Skip decoder work in pure
+    # contrastive mode since it's not needed.
+    if params.att_rate != 0.0 and params.learning_type != "contrastive":
         with torch.set_grad_enabled(is_training):
             mmodel = model.module if hasattr(model, "module") else model
             # Note: We need to generate an unsorted version of token_ids
@@ -931,8 +909,73 @@ def compute_loss(
             )
         total_loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
     else:
-        att_loss = torch.tensor([0])
+        # No attention loss computed (either att_rate == 0 or pure contrastive mode)
+        att_loss = torch.tensor(0.0, device=model_device)
         total_loss = ctc_loss
+
+    # Compute distillation loss if requested (hybrid/asr with self-distillation)
+    # We compute this after CTC to reuse cached encoder/teacher outputs.
+    distillation_loss = torch.tensor(0.0, device=model_device)
+    try:
+        need_distill = compute_distill  # from earlier scope
+    except NameError:
+        need_distill = params.learning_type in ["hybrid", "asr"] and use_self_distillation and (clean_feature is not None)
+
+    if need_distill:
+        # If projection heads are present and cached, use them (preferred)
+        if params.knowledge == "encoder-output":
+            if params.use_proj_layer and cached_teacher_projected_outputs is not None and cached_student_projected_outputs is not None:
+                from conformer import compute_multi_layer_distillation_loss
+                distillation_loss = compute_multi_layer_distillation_loss(
+                    teacher_knowledge=cached_teacher_projected_outputs,
+                    student_knowledge=cached_student_projected_outputs,
+                    knowledge_lens=output_lens,
+                    layer_indices=list(range(len(distill_layers))),
+                    loss_type=params.distill_loss_type,
+                    knowledge_type="encoder-output",
+                    aggregation=params.distill_aggregation,
+                )
+            elif hiddens is not None and t_hidden is not None:
+                # Fallback to using encoder hidden states directly
+                from conformer import compute_multi_layer_distillation_loss, compute_distillation_loss
+                if len(distill_layers) == 1:
+                    distillation_loss = compute_distillation_loss(
+                        teacher_knowledge=t_output,
+                        student_knowledge=nnet_output,
+                        knowledge_lens=output_lens,
+                        loss_type=params.distill_loss_type,
+                        knowledge_type="encoder-output",
+                    )
+                else:
+                    distillation_loss = compute_multi_layer_distillation_loss(
+                        teacher_knowledge=t_hidden,
+                        student_knowledge=hiddens,
+                        knowledge_lens=output_lens,
+                        layer_indices=distill_layers,
+                        loss_type=params.distill_loss_type,
+                        knowledge_type="encoder-output",
+                        aggregation=params.distill_aggregation,
+                    )
+            else:
+                logging.warning("Distillation requested but projected or hidden outputs unavailable; skipping distillation for this batch")
+                distillation_loss = torch.tensor(0.0, device=model_device)
+
+        elif params.knowledge == "attention-map":
+            if att_maps is not None and t_maps is not None:
+                from conformer import compute_multi_layer_distillation_loss
+                distillation_loss = compute_multi_layer_distillation_loss(
+                    teacher_knowledge=t_maps,
+                    student_knowledge=att_maps,
+                    knowledge_lens=output_lens,
+                    layer_indices=distill_layers,
+                    loss_type="kl",
+                    knowledge_type="attention-map",
+                    aggregation=params.distill_aggregation,
+                    temperature=params.distill_temperature,
+                )
+            else:
+                logging.warning("Attention maps not found; skipping attention-map distillation for this batch")
+                distillation_loss = torch.tensor(0.0, device=model_device)
 
     # Compute contrastive loss if enabled
     contrastive_loss = torch.tensor(0.0, device=model_device)
@@ -987,27 +1030,36 @@ def compute_loss(
         teacher_projected_outputs = []
 
         if params.use_proj_layer and hasattr(mmodel, "proj_layer"):
-            # Use the model's proj_layer for both student and teacher projection
-            for l in student_layer_outputs:
-                if hasattr(mmodel, 'normalize_before') and mmodel.normalize_before:
-                    normalized = mmodel.after_norm(l)
-                else:
-                    normalized = l
-                student_projected_outputs.append(mmodel.proj_layer(normalized))
-
-            # For teacher, try to use teacher_model's proj_layer if it's an EMA model
-            if clean_feature is not None:
-                tmodel = teacher_model if (ema_teacher is not None and params.batch_idx_train >= params.ema_start_step) else mmodel
-                for l in teacher_layer_outputs:
-                    if hasattr(tmodel, 'normalize_before') and tmodel.normalize_before:
-                        normalized = tmodel.after_norm(l)
+            # Prefer cached projected outputs if available (computed earlier for
+            # distillation). This avoids recomputing projections/encoder runs.
+            if 'cached_student_projected_outputs' in locals() and cached_student_projected_outputs is not None:
+                student_projected_outputs = cached_student_projected_outputs
+            else:
+                # Use the model's proj_layer for both student and teacher projection
+                for l in student_layer_outputs:
+                    if hasattr(mmodel, 'normalize_before') and mmodel.normalize_before:
+                        normalized = mmodel.after_norm(l)
                     else:
                         normalized = l
-                    # If teacher is EMA wrapper, it should have same interface
-                    if hasattr(tmodel, 'proj_layer'):
-                        teacher_projected_outputs.append(tmodel.proj_layer(normalized))
-                    else:
-                        teacher_projected_outputs.append(normalized)
+                    student_projected_outputs.append(mmodel.proj_layer(normalized))
+
+            # For teacher, prefer cached teacher projections
+            if 'cached_teacher_projected_outputs' in locals() and cached_teacher_projected_outputs is not None:
+                teacher_projected_outputs = cached_teacher_projected_outputs
+            else:
+                # For teacher, try to use teacher_model's proj_layer if it's an EMA model
+                if clean_feature is not None:
+                    tmodel = teacher_model if (ema_teacher is not None and params.batch_idx_train >= params.ema_start_step) else mmodel
+                    for l in teacher_layer_outputs:
+                        if hasattr(tmodel, 'normalize_before') and tmodel.normalize_before:
+                            normalized = tmodel.after_norm(l)
+                        else:
+                            normalized = l
+                        # If teacher is EMA wrapper, it should have same interface
+                        if hasattr(tmodel, 'proj_layer'):
+                            teacher_projected_outputs.append(tmodel.proj_layer(normalized))
+                        else:
+                            teacher_projected_outputs.append(normalized)
         else:
             # No projection layer: use raw layer outputs
             student_projected_outputs = student_layer_outputs
@@ -1027,6 +1079,9 @@ def compute_loss(
                     noisy_features=noisy_avg,
                     negative_pair=params.negative_pair,
                     temperature=params.contrastive_temperature,
+                    negative_mode=params.contrastive_negative_mode,
+                    num_negatives=params.contrastive_num_negatives,
+                    window=params.contrastive_window,
                 )
                 logging.debug(f"Contrastive loss (layer_avg) computed using layers {clayers}: {contrastive_loss.item():.6f}")
             else:
@@ -1037,6 +1092,9 @@ def compute_loss(
                         noisy_features=student_projected_outputs[i],
                         negative_pair=params.negative_pair,
                         temperature=params.contrastive_temperature,
+                        negative_mode=params.contrastive_negative_mode,
+                        num_negatives=params.contrastive_num_negatives,
+                        window=params.contrastive_window,
                     )
                     per_layer_losses.append(l)
 
@@ -1115,7 +1173,10 @@ def compute_contrastive_loss(
     clean_features: torch.Tensor,
     noisy_features: torch.Tensor,
     negative_pair: str = "clean",
-    temperature: float = 0.07
+    temperature: float = 0.07,
+    negative_mode: str = "k-sampled",
+    num_negatives: int = 100,
+    window: int = 5,
 ) -> torch.Tensor:
     """
     Compute InfoNCE contrastive loss between clean and noisy features.
@@ -1142,76 +1203,103 @@ def compute_contrastive_loss(
     # For each time step t and batch n, clean_features[t,n] is anchor
     # and noisy_features[t,n] is the corresponding positive
     
-    total_loss = 0.0
-    total_samples = 0
-    
-    for t in range(T):
-        for n in range(N):
-            # Anchor: clean feature at time t, batch n
-            anchor = clean_norm[t, n]  # (C,)
-            
-            # Positive: corresponding noisy feature at same time t, batch n  
-            positive = noisy_norm[t, n]  # (C,)
-            
-            # Construct negatives based on negative_pair type
-            if negative_pair == "clean":
-                # Negatives: all other clean features (different time or different batch)
-                negatives_list = []
-                for t_neg in range(T):
-                    for n_neg in range(N):
-                        if not (t_neg == t and n_neg == n):  # Exclude anchor itself
-                            negatives_list.append(clean_norm[t_neg, n_neg])
-                
-            elif negative_pair == "noisy":
-                # Negatives: all other noisy features (different time or different batch)
-                negatives_list = []
-                for t_neg in range(T):
-                    for n_neg in range(N):
-                        if not (t_neg == t and n_neg == n):  # Exclude corresponding positive
-                            negatives_list.append(noisy_norm[t_neg, n_neg])
-                            
-            elif negative_pair == "clean-noisy":
-                # Negatives: all other clean and noisy features
-                negatives_list = []
-                # Add clean negatives (excluding anchor)
-                for t_neg in range(T):
-                    for n_neg in range(N):
-                        if not (t_neg == t and n_neg == n):  # Exclude anchor
-                            negatives_list.append(clean_norm[t_neg, n_neg])
-                # Add noisy negatives (excluding positive)
-                for t_neg in range(T):
-                    for n_neg in range(N):
-                        if not (t_neg == t and n_neg == n):  # Exclude positive
-                            negatives_list.append(noisy_norm[t_neg, n_neg])
-            else:
-                raise ValueError(f"Unknown negative_pair type: {negative_pair}")
-            
-            if len(negatives_list) == 0:
-                continue  # Skip if no negatives available
-                
-            negatives = torch.stack(negatives_list)  # (num_negatives, C)
-            
-            # Compute similarities
-            pos_sim = torch.dot(anchor, positive) / temperature  # scalar
-            neg_sims = torch.mv(negatives, anchor) / temperature  # (num_negatives,)
-            
-            # InfoNCE loss: log(exp(pos_sim) / (exp(pos_sim) + sum(exp(neg_sims))))
-            # Equivalent to cross-entropy with positive at index 0
-            logits = torch.cat([pos_sim.unsqueeze(0), neg_sims])  # (1 + num_negatives,)
-            
-            # Target: positive is at index 0
-            target = torch.tensor(0, device=device, dtype=torch.long)
-            
-            # Cross-entropy loss for this anchor-positive pair
-            loss = F.cross_entropy(logits.unsqueeze(0), target.unsqueeze(0))
-            total_loss += loss
-            total_samples += 1
-    
-    if total_samples == 0:
+    # We follow the user's specification:
+    # - Anchor: clean_features[t, n]
+    # - Positive: noisy_features[t, n]
+    # - Negatives: other time positions within the same sample n (i.e. noisy_features[t_neg, n] for t_neg != t)
+    #
+    # Vectorized per-sample implementation: for each sample n, compute the T x T
+    # similarity matrix between clean[:, n, :] and noisy[:, n, :]. For anchor t
+    # the positive is diag(sim)[t], and negatives are sim[t, j] for j != t.
+
+    # If sequence length is 1 there are no negatives; return zero tensor
+    if T <= 1:
         return torch.tensor(0.0, device=device, requires_grad=True)
-    
-    # Average over all anchor-positive pairs
-    contrastive_loss = total_loss / total_samples
+
+    # Rearrange to (N, T, C)
+    clean_b = clean_norm.permute(1, 0, 2).contiguous()  # (N, T, C)
+    noisy_b = noisy_norm.permute(1, 0, 2).contiguous()  # (N, T, C)
+
+    # Similarity tensor S: (N, T, T) where S[n, i, j] = <clean_b[n,i], noisy_b[n,j]>
+    S = torch.bmm(clean_b, noisy_b.transpose(1, 2))  # (N, T, T)
+
+    # Positive similarities are the diagonal entries S[:, t, t]
+    idx = torch.arange(T, device=device)
+    pos = S[:, idx, idx]  # (N, T)
+
+    eye = torch.eye(T, dtype=torch.bool, device=device)
+
+    if negative_mode == "within-sample-all":
+        # Use all other time positions as negatives (T-1 negatives)
+        mask = ~eye  # (T, T)
+        negs = S.masked_select(mask.unsqueeze(0)).view(N, T, T - 1)  # (N, T, T-1)
+        logits = torch.cat([pos.unsqueeze(-1), negs], dim=-1) / temperature  # (N, T, T)
+
+    elif negative_mode == "k-sampled":
+        # Sample K negatives per anchor from the T-1 other positions (with replacement)
+        K = max(1, int(num_negatives))
+        if T - 1 <= 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # Sample indices in range [0, T-2] and map to [0..T-1] excluding anchor t
+        idx_rand = torch.randint(0, T - 1, (N, T, K), device=device)
+        t_ids = torch.arange(T, device=device).view(1, T, 1)
+        j = idx_rand + (idx_rand >= t_ids).long()  # (N, T, K) mapped to actual positions
+
+        # Gather negative features: noisy_b shape (N, T, C)
+        # Expand noisy_b for gather along dim=1
+        noisy_exp = noisy_b.unsqueeze(2).expand(-1, -1, K, -1)  # (N, T, K, C)
+        j_exp = j.unsqueeze(-1).expand(-1, -1, -1, C)  # (N, T, K, C)
+        neg_feats = torch.gather(noisy_exp, dim=1, index=j_exp)  # (N, T, K, C)
+
+        # Compute negative similarities: dot product over C
+        pos_unsq = pos.unsqueeze(-1)  # (N, T, 1)
+        negs = (neg_feats * clean_b.unsqueeze(2)).sum(dim=-1)  # (N, T, K)
+        logits = torch.cat([pos_unsq, negs], dim=-1) / temperature  # (N, T, 1+K)
+
+    elif negative_mode == "local-window":
+        # For each anchor t, allowed negatives are positions in [t-window, t+window] excluding t
+        w = max(0, int(window))
+        K = max(1, int(num_negatives))
+
+        # Build per-anchor mask (T, T)
+        idxs = torch.arange(T, device=device)
+        anchors = idxs.view(T, 1)
+        candidates = idxs.view(1, T)
+        anchor_mask = (candidates >= (anchors - w)) & (candidates <= (anchors + w)) & (candidates != anchors)
+        # Expand to (N, T, T)
+        mask_batch = anchor_mask.unsqueeze(0).expand(N, -1, -1)  # (N, T, T)
+
+        # Prepare weights for multinomial sampling: shape (N*T, T)
+        W = mask_batch.float().view(N * T, T)
+        # For rows with no allowed negatives (shouldn't happen if w>0 and T>1), fall back to uniform over T-1
+        sums = W.sum(dim=1)
+        zero_rows = (sums == 0)
+        if zero_rows.any():
+            # Fallback to uniform weights if no allowed negatives (rare)
+            W[zero_rows] = 1.0
+
+        # Sample K indices per anchor (with replacement to guarantee K)
+        sampled = torch.multinomial(W, K, replacement=True)  # (N*T, K)
+        sampled = sampled.view(N, T, K)  # (N, T, K)
+
+        # Gather negative features
+        noisy_exp = noisy_b.unsqueeze(2).expand(-1, -1, K, -1)  # (N, T, K, C)
+        sampled_exp = sampled.unsqueeze(-1).expand(-1, -1, -1, C)  # (N, T, K, C)
+        neg_feats = torch.gather(noisy_exp, dim=1, index=sampled_exp)  # (N, T, K, C)
+
+        negs = (neg_feats * clean_b.unsqueeze(2)).sum(dim=-1)  # (N, T, K)
+        logits = torch.cat([pos.unsqueeze(-1), negs], dim=-1) / temperature  # (N, T, 1+K)
+
+    else:
+        raise ValueError(f"Unknown negative_mode: {negative_mode}")
+
+    # Flatten anchors across batch so we can compute cross-entropy in one call
+    logits_flat = logits.view(-1, logits.size(-1))  # (N*T, num_classes)
+    targets = torch.zeros(logits_flat.size(0), dtype=torch.long, device=device)
+
+    # Cross-entropy averaged over all anchors (samples * time)
+    contrastive_loss = F.cross_entropy(logits_flat, targets, reduction='mean')
     return contrastive_loss
 
 

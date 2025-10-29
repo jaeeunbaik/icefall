@@ -15,9 +15,9 @@ enable_concatenate=false
 
 # Training parameters
 world_size=1 
-max_duration=300
+max_duration=350
 valid_max_duration=15         
-num_buckets=300               
+num_buckets=350               
 num_workers=8    
 warm_step=10000
 lang_dir="./data/lang_bpe_1024"
