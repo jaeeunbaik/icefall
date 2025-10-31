@@ -40,6 +40,12 @@ class Conformer(Transformer):
         cnn_module_kernel (int): Kernel size of convolution module
         normalize_before (bool): whether to use layer_norm before the first block.
         vgg_frontend (bool): whether to use vgg frontend.
+        use_proj_layer (bool): whether to use projection layer after encoder
+        distill_layers (list, optional): list of layer indices for distillation
+        proj_dim (int, optional): projection dimension for prototype-based distillation.
+                                 If provided, projection layers map d_model -> proj_dim.
+                                 Prototypes will have shape [num_prototypes, proj_dim].
+                                 If None, uses d_model dimension for backward compatibility.
     """
 
     def __init__(
@@ -59,6 +65,7 @@ class Conformer(Transformer):
         use_feat_batchnorm: Union[float, bool] = 0.1,
         use_proj_layer: bool = True,
         distill_layers: Optional[list] = None,
+        proj_dim: Optional[int] = None,
     ) -> None:
         super(Conformer, self).__init__(
             num_features=num_features,
@@ -99,15 +106,21 @@ class Conformer(Transformer):
             self.after_norm = identity
         
         self.use_proj_layer = use_proj_layer
+        # Set projection layer output dimension
+        # proj_dim: for prototype-based distillation (d_model -> smaller proj_dim)
+        # If None, keep d_model dimension for backward compatibility
+        self.proj_output_dim = proj_dim if proj_dim is not None else d_model
         if use_proj_layer:
-            self.proj_layer = nn.Linear(d_model, d_model)
+            self.proj_layer = nn.Linear(d_model, self.proj_output_dim)
         
         # Initialize distillation layer projection heads
         self.distill_layers = distill_layers if distill_layers is not None else []
         self.distill_projection_heads = nn.ModuleList()
         if self.distill_layers and use_proj_layer:
             for _ in self.distill_layers:
-                self.distill_projection_heads.append(nn.Linear(d_model, d_model))
+                # Each distillation projection head maps d_model -> proj_output_dim
+                # This ensures consistency with prototypes that have shape [num_prototypes, proj_output_dim]
+                self.distill_projection_heads.append(nn.Linear(d_model, self.proj_output_dim))
 
     def run_encoder(
         self, x: Tensor, supervisions: Optional[Supervisions] = None
@@ -1131,6 +1144,7 @@ def compute_multi_layer_distillation_loss(
     temperature: float = 1.0,
     prototype_manager=None,
     target_layers: list = None,
+    layer_weights: list = None,
 ):
     """
     Compute multi-layer distillation loss between teacher and student knowledge.
@@ -1145,6 +1159,8 @@ def compute_multi_layer_distillation_loss(
         temperature: Temperature for softmax (used with KL divergence)
         prototype_manager: PrototypeKMeansManager instance for prototype-based KL loss
         target_layers: List of actual layer indices that correspond to prototypes
+        layer_weights: List of weights for each layer loss. If None, uses equal weights (1.0).
+                      Should have same length as layer_indices. Example: [0.5, 0.7, 1.0]
     
     Returns:
         Aggregated distillation loss tensor
@@ -1173,8 +1189,17 @@ def compute_multi_layer_distillation_loss(
         )
         
     elif aggregation == "output_avg":
-        # Compute loss for each layer and average them
+        # Compute loss for each layer and aggregate with optional weights
         losses = []
+        weights = []
+        
+        # Set default weights if not provided
+        if layer_weights is None:
+            layer_weights = [1.0] * len(layer_indices)
+        elif len(layer_weights) != len(layer_indices):
+            logging.warning(f"layer_weights length ({len(layer_weights)}) doesn't match layer_indices length ({len(layer_indices)}). Using equal weights.")
+            layer_weights = [1.0] * len(layer_indices)
+        
         for idx, layer_idx in enumerate(layer_indices):
             if layer_idx >= len(teacher_knowledge) or layer_idx >= len(student_knowledge):
                 continue  # Skip invalid layer indices
@@ -1191,10 +1216,18 @@ def compute_multi_layer_distillation_loss(
                 prototype_manager=prototype_manager,
                 layer_idx=actual_layer_idx,
             )
-            losses.append(layer_loss)
+            
+            # Apply layer weight
+            weight = layer_weights[idx] if idx < len(layer_weights) else 1.0
+            weighted_loss = layer_loss * weight
+            losses.append(weighted_loss)
+            weights.append(weight)
         
         if losses:
-            loss = torch.stack(losses).mean()
+            # Weighted sum of losses
+            loss = torch.stack(losses).sum()
+            # Optional: normalize by sum of weights for weighted average
+            # loss = loss / sum(weights)  # Uncomment for weighted average instead of weighted sum
         else:
             loss = torch.tensor(0.0, device=device, requires_grad=True)
     else:

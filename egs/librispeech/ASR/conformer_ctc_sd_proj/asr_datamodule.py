@@ -315,6 +315,18 @@ class LibriSpeechAsrDataModule:
             "field: batch['supervisions']['cut'] with the cuts that "
             "were used to construct it.",
         )
+        group.add_argument(
+            "--mix-librilight",
+            type=str2bool,
+            default=False,
+            help="When enabled, mix LibriSpeech with LibriLight data for training.",
+        )
+        group.add_argument(
+            "--librilight-ratio",
+            type=float,
+            default=0.5,
+            help="Ratio of LibriLight data to mix with LibriSpeech (0.0-1.0).",
+        )
 
         group.add_argument(
             "--num-workers",
@@ -418,6 +430,29 @@ class LibriSpeechAsrDataModule:
           shuffle:
             If provided, overrides self.args.shuffle. Otherwise uses self.args.shuffle.
         """
+        # Mix with LibriLight if requested
+        if self.args.mix_librilight:
+            logging.info("Mixing LibriSpeech with LibriLight data")
+            
+            librilight_cuts = self.librilight_train_cuts()
+            
+            # Calculate mixing ratio
+            ratio = self.args.librilight_ratio
+            if not (0.0 <= ratio <= 1.0):
+                raise ValueError(f"librilight_ratio must be between 0.0 and 1.0, got {ratio}")
+            
+            # Sample LibriLight cuts based on ratio
+            if ratio > 0.0:
+                target_librilight_duration = len(cuts_train) * ratio / (1 - ratio)
+                librilight_sampled = librilight_cuts.subset(first=int(target_librilight_duration))
+                
+                # Combine datasets
+                cuts_train = cuts_train + librilight_sampled
+                cuts_train = cuts_train.shuffle(random_seed=42)
+                
+                logging.info(f"Combined dataset: {len(cuts_train)} cuts total")
+                logging.info(f"LibriLight ratio: ~{ratio:.2f}")
+
         # Setup augmentation transforms (for noisy dataset)
         transforms = []
         min_snr, max_snr = list(map(int, self.args.snr_range.split(',')))
@@ -731,21 +766,6 @@ class LibriSpeechAsrDataModule:
             self.args.manifest_dir / "librispeech_cuts_test-other.jsonl.gz"
         )
 
-    @lru_cache()
-    def gigaspeech_subset_small_cuts(self) -> CutSet:
-        logging.info("About to get Gigaspeech subset-S cuts")
-        return load_manifest_lazy(self.args.manifest_dir / "cuts_S.jsonl.gz")
-
-    @lru_cache()
-    def gigaspeech_dev_cuts(self) -> CutSet:
-        logging.info("About to get Gigaspeech dev cuts")
-        return load_manifest_lazy(self.args.manifest_dir / "cuts_DEV.jsonl.gz")
-
-    @lru_cache()
-    def gigaspeech_test_cuts(self) -> CutSet:
-        logging.info("About to get Gigaspeech test cuts")
-        return load_manifest_lazy(self.args.manifest_dir / "cuts_TEST.jsonl.gz")
-
     def chime4_test_dataloaders(self) -> Dict[str, DataLoader]:
         """Create CHiME-4 test dataloaders for different conditions."""
         from pathlib import Path
@@ -881,3 +901,242 @@ class LibriSpeechAsrDataModule:
         cuts = CutSet.from_manifests(recordings=recording_set, supervisions=supervision_set)
         
         return cuts
+
+    @lru_cache()
+    def librilight_train_cuts(self) -> CutSet:
+        """Load LibriLight training cuts."""
+        logging.info("Loading LibriLight training cuts")
+        
+        librilight_dir = Path(self.args.librilight_dir)
+        subset = self.args.librilight_subset
+        
+        cuts_path = librilight_dir / f"librilight_{subset}_cuts.jsonl.gz"
+        
+        if not cuts_path.exists():
+            raise FileNotFoundError(
+                f"LibriLight cuts not found: {cuts_path}\n"
+                f"Please run prepare_librilight.sh first"
+            )
+        
+        cuts = load_manifest_lazy(cuts_path)
+        logging.info(f"Loaded {len(cuts)} LibriLight cuts")
+        return cuts
+
+
+class LibriLightAsrDataModule(LibriSpeechAsrDataModule):
+    """
+    DataModule specifically for LibriLight ASR experiments.
+    
+    LibriLight is a large-scale ASR corpus with different subsets:
+    - small: ~10k hours
+    - medium: ~50k hours  
+    - large: ~60k hours
+    
+    This module extends LibriSpeechAsrDataModule to handle LibriLight-specific
+    data loading and preprocessing.
+    """
+    
+    @classmethod
+    def add_arguments(cls, parser: argparse.ArgumentParser):
+        # Add LibriLight-specific arguments (skip LibriSpeech arguments to avoid conflicts)
+        group = parser.add_argument_group(
+            title="LibriLight ASR data options",
+            description="LibriLight-specific data loading options"
+        )
+        
+        group.add_argument(
+            "--librilight-manifest-dir",
+            type=Path,
+            default=Path("data/fbank"),
+            help="Path to LibriLight manifest directory (containing cuts files with fbank features)"
+        )
+        
+        group.add_argument(
+            "--librilight-subset",
+            type=str,
+            default="medium",
+            choices=["small", "medium", "large"],
+            help="LibriLight subset to use for training"
+        )
+        
+        group.add_argument(
+            "--librilight-sampling-ratio",
+            type=float,
+            default=1.0,
+            help="Ratio of LibriLight data to sample (0.0-1.0)"
+        )
+        
+        group.add_argument(
+            "--librilight-max-duration-per-cut",
+            type=float,
+            default=30.0,
+            help="Maximum duration per cut in seconds (LibriLight has very long utterances)"
+        )
+        
+        group.add_argument(
+            "--enable-librilight-chunking",
+            type=str2bool,
+            default=True,
+            help="Split long LibriLight cuts into smaller chunks"
+        )
+
+    def __init__(self, args: argparse.Namespace):
+        super().__init__(args)
+        
+        # Override manifest_dir to use LibriLight-specific path
+        if hasattr(args, 'librilight_manifest_dir'):
+            self.librilight_manifest_dir = args.librilight_manifest_dir
+        else:
+            self.librilight_manifest_dir = Path("data/fbank")
+            
+        logging.info(f"LibriLight manifest directory: {self.librilight_manifest_dir}")
+        logging.info(f"LibriLight subset: {args.librilight_subset}")
+
+    @lru_cache()
+    def librilight_train_cuts(self) -> CutSet:
+        """Load LibriLight training cuts with optional chunking and sampling."""
+        subset = self.args.librilight_subset
+        logging.info(f"Loading LibriLight {subset} training cuts")
+        
+        # Construct manifest path
+        manifest_file = f"librilight_{subset}_cuts_train.jsonl.gz"
+        cuts_path = self.librilight_manifest_dir / manifest_file
+        
+        if not cuts_path.exists():
+            # Try alternative naming
+            alt_manifest_file = f"cuts_train_{subset}.jsonl.gz"
+            cuts_path = self.librilight_manifest_dir / alt_manifest_file
+            
+        if not cuts_path.exists():
+            raise FileNotFoundError(
+                f"LibriLight training cuts not found at {cuts_path} or alternative paths.\n"
+                f"Please prepare LibriLight manifests first using prepare_librilight.sh"
+            )
+        
+        cuts = load_manifest_lazy(cuts_path)
+        logging.info(f"Loaded {len(cuts)} LibriLight {subset} training cuts")
+        
+        # Apply chunking if enabled (LibriLight has very long utterances)
+        if self.args.enable_librilight_chunking:
+            max_duration = self.args.librilight_max_duration_per_cut
+            logging.info(f"Chunking LibriLight cuts to max {max_duration}s per cut")
+            
+            chunked_cuts = []
+            for cut in cuts:
+                if cut.duration > max_duration:
+                    # Split long cuts into chunks
+                    num_chunks = int(cut.duration / max_duration) + 1
+                    chunk_duration = cut.duration / num_chunks
+                    
+                    for i in range(num_chunks):
+                        start = i * chunk_duration
+                        end = min((i + 1) * chunk_duration, cut.duration)
+                        
+                        # Create chunk using truncate with proper supervision handling
+                        chunk = cut.truncate(offset=start, duration=end-start, keep_excessive_supervisions=False)
+                        chunk.id = f"{cut.id}_chunk_{i:03d}"
+                        chunked_cuts.append(chunk)
+                else:
+                    chunked_cuts.append(cut)
+            
+            cuts = CutSet.from_cuts(chunked_cuts)
+            logging.info(f"After chunking: {len(cuts)} cuts")
+        
+        # Apply sampling if ratio < 1.0
+        sampling_ratio = self.args.librilight_sampling_ratio
+        if sampling_ratio < 1.0:
+            original_size = len(cuts)
+            subset_size = int(original_size * sampling_ratio)
+            cuts = cuts.subset(first=subset_size)
+            logging.info(f"Sampled {len(cuts)}/{original_size} cuts (ratio: {sampling_ratio})")
+        
+        return cuts
+
+    @lru_cache()
+    def librilight_dev_cuts(self) -> CutSet:
+        """Load LibriLight development/validation cuts."""
+        subset = self.args.librilight_subset
+        logging.info(f"Loading LibriLight {subset} development cuts")
+        
+        # LibriLight doesn't have standard dev set, use LibriSpeech dev sets
+        logging.info("Using LibriSpeech dev-clean as validation for LibriLight")
+        return self.dev_clean_cuts()
+
+    def train_dataloaders(
+        self,
+        cuts_train: Optional[CutSet] = None,
+        sampler_state_dict: Optional[Dict[str, Any]] = None,
+        shuffle: Optional[bool] = None,
+    ) -> DataLoader:
+        """
+        Create LibriLight training dataloader.
+        
+        Args:
+            cuts_train: If provided, use these cuts. Otherwise load LibriLight training cuts.
+            sampler_state_dict: Sampler state dict for resuming training
+            shuffle: Whether to shuffle data
+        """
+        if cuts_train is None:
+            cuts_train = self.librilight_train_cuts()
+        
+        # Use parent class implementation with LibriLight cuts
+        return super().train_dataloaders(cuts_train, sampler_state_dict, shuffle)
+
+    def valid_dataloaders(self, cuts_valid: Optional[CutSet] = None) -> DataLoader:
+        """Create LibriLight validation dataloader."""
+        if cuts_valid is None:
+            cuts_valid = self.librilight_dev_cuts()
+        
+        return super().valid_dataloaders(cuts_valid)
+
+    def all_test_dataloaders(self) -> Dict[str, DataLoader]:
+        """
+        Create all test dataloaders including LibriSpeech test sets.
+        
+        For LibriLight, we typically evaluate on LibriSpeech test sets
+        since LibriLight doesn't have standard evaluation sets.
+        """
+        test_dataloaders = {}
+        
+        # Use LibriSpeech test sets for evaluation
+        try:
+            test_clean_cuts = self.test_clean_cuts()
+            test_other_cuts = self.test_other_cuts()
+            
+            test_dataloaders["test-clean"] = self.test_dataloaders(test_clean_cuts)
+            test_dataloaders["test-other"] = self.test_dataloaders(test_other_cuts)
+            
+            logging.info("Created LibriSpeech test dataloaders for LibriLight evaluation")
+        except Exception as e:
+            logging.warning(f"Failed to create LibriSpeech test dataloaders: {e}")
+        
+        # Add CHiME-4 if available
+        try:
+            chime4_dls = self.chime4_test_dataloaders()
+            for test_set_name, dl in chime4_dls.items():
+                test_dataloaders[f"chime4-{test_set_name}"] = dl
+        except Exception as e:
+            logging.warning(f"Failed to create CHiME-4 test dataloaders: {e}")
+            
+        return test_dataloaders
+
+    # Override LibriSpeech-specific methods to use LibriLight data
+    @lru_cache()
+    def train_clean_100_cuts(self) -> CutSet:
+        """Override to return LibriLight training cuts instead."""
+        return self.librilight_train_cuts()
+
+    @lru_cache()
+    def train_clean_360_cuts(self) -> CutSet:
+        """Override to return LibriLight training cuts instead.""" 
+        return self.librilight_train_cuts()
+
+    @lru_cache()
+    def train_other_500_cuts(self) -> CutSet:
+        """Override to return LibriLight training cuts instead."""
+        return self.librilight_train_cuts()
+
+    @lru_cache() 
+    def train_all_shuf_cuts(self) -> CutSet:
+        """Override to return LibriLight training cuts instead."""
+        return self.librilight_train_cuts()

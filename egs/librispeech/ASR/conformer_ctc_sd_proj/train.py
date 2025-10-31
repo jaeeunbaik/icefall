@@ -41,7 +41,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 import sentencepiece as spm
-from asr_datamodule import LibriSpeechAsrDataModule
+from asr_datamodule import LibriSpeechAsrDataModule, LibriLightAsrDataModule
 from conformer import Conformer
 from ema_teacher import EMATeacher
 from k_means_clustering import PrototypeKMeansManager
@@ -289,6 +289,16 @@ def get_parser():
              "Higher values make attention distributions smoother.",
     )
     
+    parser.add_argument(
+        "--layer-weights",
+        type=str,
+        default=None,
+        help="Comma-separated weights for each distillation layer loss. "
+             "Should match the number of layers in --distill-layers. "
+             "Example: '0.5,0.7,1.0' for three layers. "
+             "If not provided, all layers get equal weights (1.0).",
+    )
+    
     # EMA Teacher Model Arguments
     parser.add_argument(
         "--ema-decay",
@@ -373,13 +383,6 @@ def get_parser():
     
     parser.add_argument(
         "--learning-type",
-        "--learning-type",
-        type=str,
-        default="encoder-only",
-        choices=["encoder-only", "hybrid", "asr"],
-        help="""Training method, encoder-only for training only encoder, hybrid when loss is weighted sum of self-distillation and asr
-        asr when training loss is only composed of asr loss
-        """
         default="encoder-only",
         choices=["encoder-only", "hybrid", "asr"],
         help="""Training method, encoder-only for training only encoder, hybrid when loss is weighted sum of self-distillation and asr
@@ -824,6 +827,19 @@ def compute_loss(
                 
                 if teacher_projected_outputs and student_projected_outputs:
                     from conformer import compute_multi_layer_distillation_loss
+                    
+                    # Parse layer weights from string if provided
+                    layer_weights = None
+                    if params.layer_weights is not None:
+                        try:
+                            layer_weights = [float(x.strip()) for x in params.layer_weights.split(',')]
+                            if len(layer_weights) != len(distill_layers):
+                                logging.warning(f"layer_weights length ({len(layer_weights)}) doesn't match distill_layers length ({len(distill_layers)}). Using equal weights.")
+                                layer_weights = None
+                        except ValueError as e:
+                            logging.warning(f"Failed to parse layer_weights '{params.layer_weights}': {e}. Using equal weights.")
+                            layer_weights = None
+                    
                     distillation_loss = compute_multi_layer_distillation_loss(
                         teacher_knowledge=teacher_projected_outputs,
                         student_knowledge=student_projected_outputs,
@@ -834,6 +850,7 @@ def compute_loss(
                         temperature=params.distill_temperature,
                         prototype_manager=prototype_manager,
                         target_layers=distill_layers,  # Pass actual layer indices for prototype lookup
+                        layer_weights=layer_weights,  # Add layer weights parameter
                     )
                 else:
                     logging.warning("Failed to get projected outputs for distillation")
@@ -1619,23 +1636,31 @@ def run(rank, world_size, args):
     else:
         use_librilight = (params.dataset_type == "librilight")
     
+    # Create appropriate data module based on dataset type
     if use_librilight:
-        logging.info("Using LibriLight dataset for encoder-only training")
-        # TODO: Replace with actual LibriLight data module when available
-        # For now, use LibriSpeech as placeholder
-        logging.warning("LibriLight dataset not yet implemented. Using LibriSpeech as placeholder.")
-        data_module = LibriSpeechAsrDataModule(args)
-        # When LibriLight is available, use:
-        # from librilight_datamodule import LibriLightAsrDataModule
-        # data_module = LibriLightAsrDataModule(args)
+        logging.info("Using LibriLight dataset for prototype-based knowledge distillation")
+        data_module = LibriLightAsrDataModule(args)
+        # Use LibriLight training data for K-means clustering and training
+        train_cuts = data_module.librilight_train_cuts()
+        logging.info(f"Loaded LibriLight training cuts: {len(train_cuts)} utterances")
     else:
         logging.info("Using LibriSpeech dataset")
         data_module = LibriSpeechAsrDataModule(args)
-
-    if params.full_libri:
-        train_cuts = data_module.train_all_shuf_cuts()
-    else:
-        train_cuts = data_module.train_clean_100_cuts()
+        
+        # Load appropriate LibriSpeech training cuts based on configuration
+        if params.mini_libri:
+            logging.info("Using mini LibriSpeech (train-clean-5)")
+            train_cuts = data_module.train_clean_5_cuts()
+        elif params.full_libri:
+            logging.info("Using full LibriSpeech (960h)")
+            train_cuts = (
+                data_module.train_clean_100_cuts()
+                + data_module.train_clean_360_cuts()
+                + data_module.train_other_500_cuts()
+            )
+        else:
+            logging.info("Using LibriSpeech clean-100h subset")
+            train_cuts = data_module.train_clean_100_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
@@ -1653,11 +1678,22 @@ def run(rank, world_size, args):
     # For self-distillation: use shuffle=True with fixed seed for deterministic but diverse ordering
     train_dl = data_module.train_dataloaders(train_cuts, shuffle=True)
 
-    # Use only dev_clean for faster validation (dev_other can be added later)
-    valid_cuts = data_module.dev_clean_cuts()
-    # valid_cuts += data_module.dev_other_cuts()  # Comment out for faster validation
-    valid_dl = data_module.valid_dataloaders(valid_cuts)
+    # Create validation dataloader based on dataset type
+    if use_librilight:
+        # LibriLight uses LibriSpeech dev-clean for validation
+        valid_cuts = data_module.librilight_dev_cuts()
+        logging.info("Using LibriSpeech dev-clean for LibriLight validation")
+    else:
+        # Use LibriSpeech dev sets
+        if params.mini_libri:
+            valid_cuts = data_module.dev_clean_2_cuts()
+            logging.info("Using mini LibriSpeech dev-clean-2 for validation")
+        else:
+            valid_cuts = data_module.dev_clean_cuts()
+            # valid_cuts += data_module.dev_other_cuts()  # Comment out for faster validation
+            logging.info("Using LibriSpeech dev-clean for validation")
     
+    valid_dl = data_module.valid_dataloaders(valid_cuts)
     logging.info(f"Validation set size: {len(valid_cuts)} utterances")
     
     if params.sanity_check:
@@ -2050,6 +2086,7 @@ def log_validation_examples_to_tensorboard(results_dict, tb_writer, step, max_ex
 def main():
     parser = get_parser()
     LibriSpeechAsrDataModule.add_arguments(parser)
+    LibriLightAsrDataModule.add_arguments(parser)  # Add LibriLight arguments
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
     args.lang_dir = Path(args.lang_dir)

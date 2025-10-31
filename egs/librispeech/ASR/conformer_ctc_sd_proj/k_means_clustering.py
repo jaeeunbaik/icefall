@@ -116,20 +116,52 @@ class PrototypeKMeansManager:
                 if total_samples >= num_samples:
                     break
                 
-                # Assume batch contains clean audio features
+                # Handle different batch structures
                 if isinstance(batch, dict):
-                    feature = batch['feature'].to(self.device)
-                    feature_lens = batch['feature_lens'].to(self.device)
+                    if 'clean' in batch and 'inputs' in batch['clean']:
+                        # Self-distillation format with clean/noisy
+                        feature = batch['clean']['inputs'].to(self.device)
+                        supervisions = batch['clean']['supervisions']
+                    elif 'inputs' in batch:
+                        # Standard format
+                        feature = batch['inputs'].to(self.device)
+                        supervisions = batch['supervisions']
+                    elif 'feature' in batch:
+                        # Legacy format
+                        feature = batch['feature'].to(self.device)
+                        feature_lens = batch['feature_lens'].to(self.device)
+                    else:
+                        logging.warning(f"Unknown batch format. Keys: {list(batch.keys())}")
+                        continue
                 else:
+                    # Tuple format
                     feature, feature_lens = batch[0].to(self.device), batch[1].to(self.device)
+                
+                # Get feature lengths from supervisions if available
+                if 'supervisions' in locals() and 'num_frames' in supervisions:
+                    if isinstance(supervisions['num_frames'], torch.Tensor):
+                        feature_lens = supervisions['num_frames'].to(self.device)
+                    else:
+                        feature_lens = torch.tensor(supervisions['num_frames'], device=self.device)
+                elif 'feature_lens' not in locals():
+                    # Fallback: use actual feature sequence length
+                    feature_lens = torch.full((feature.size(0),), feature.size(1), device=self.device)
+            with torch.no_grad():
+                # Create proper supervision format for the model
+                supervisions = {
+                    'sequence_idx': torch.arange(feature.size(0), device=self.device),
+                    'start_frame': torch.zeros(feature.size(0), device=self.device),
+                    'num_frames': feature_lens.to(self.device),
+                    'text': [''] * feature.size(0),  # Empty text for LibriLight
+                }
                 
                 # Forward through teacher to get layer output
                 # This assumes the teacher model can output intermediate layers
                 if hasattr(teacher_model, 'extract_layer_features'):
-                    layer_output = teacher_model.extract_layer_features(feature, feature_lens, layer_idx)
+                    layer_output = teacher_model.extract_layer_features(feature, supervisions, layer_idx)
                 else:
                     # Fallback: forward through model and extract from hooks
-                    outputs = teacher_model(feature, feature_lens)
+                    outputs = teacher_model(feature, supervisions)
                     if isinstance(outputs, dict) and f'layer_{layer_idx}' in outputs:
                         layer_output = outputs[f'layer_{layer_idx}']
                     else:
@@ -137,7 +169,7 @@ class PrototypeKMeansManager:
                         layer_output = outputs if not isinstance(outputs, dict) else outputs.get('encoder_out', outputs['logits'])
                 
                 # Apply feature length masking
-                batch_size, max_len = layer_output.shape[:2]
+                batch_size = layer_output.size(1)
                 for b in range(batch_size):
                     valid_len = feature_lens[b].item()
                     valid_features = layer_output[b, :valid_len]  # [T, D]
