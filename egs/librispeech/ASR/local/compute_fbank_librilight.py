@@ -106,6 +106,13 @@ def main():
         from lhotse import CutSet
         cuts = CutSet.from_file(cuts_path)
         logging.info(f"Successfully loaded {len(cuts)} cuts using CutSet.from_file")
+        
+        # Optional: Sample for faster testing (comment out for full processing)
+        # if len(cuts) > 2000:  # If too many cuts, sample for testing
+        #     logging.info(f"Large dataset detected ({len(cuts)} cuts). Sampling 2000 for faster processing.")
+        #     logging.info("To process full dataset, comment out this sampling block in the script.")
+        #     cuts = cuts.subset(first=2000)
+        #     logging.info(f"Using {len(cuts)} cuts for processing")
     except Exception as e1:
         logging.warning(f"CutSet.from_file failed: {e1}")
         try:
@@ -135,17 +142,8 @@ def main():
                 logging.error(f"All loading methods failed. Last error: {e3}")
                 raise e3
     
-    # Configure fbank extractor
-    fbank_config = FbankConfig(
-        num_mel_bins=args.num_mel_bins,
-        sampling_rate=16000,
-        frame_length=25.0,  # 25ms
-        frame_shift=10.0,   # 10ms
-        energy_floor=1e-10,
-        dither=1.0,
-        remove_dc_offset=True,
-        round_to_power_of_two=True,
-    )
+    # Configure fbank extractor - LibriSpeech와 동일한 설정 (기본값 + num_mel_bins만)
+    fbank_config = FbankConfig(num_mel_bins=args.num_mel_bins)
     
     extractor = Fbank(fbank_config)
     
@@ -154,9 +152,7 @@ def main():
     cuts = cuts.compute_and_store_features(
         extractor=extractor,
         storage_path=f"{args.output_dir}/librilight_feats_{args.subset}",
-        batch_duration=args.batch_duration,
         num_jobs=args.num_jobs,
-        overwrite=False,
         storage_type=LilcomChunkyWriter,
     )
     

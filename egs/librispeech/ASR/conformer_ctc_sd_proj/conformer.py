@@ -151,15 +151,19 @@ class Conformer(Transformer):
             
         layer_results = None
         att_maps = None
-        x, layer_results, att_maps = self.encoder(x, pos_emb, src_key_padding_mask=mask)  # (T, B, F)
+        x, layer_results, att_maps = self.encoder(x, pos_emb, src_key_padding_mask=mask)  # (T, B, F) 확인 on 10/31
 
         if self.normalize_before:
             x = self.after_norm(x)
         
+        # Keep original encoder output for CTC (256-dim)
+        encoder_output_original = x
+        
+        # Apply projection for distillation (128-dim)
         if self.use_proj_layer:
             x = self.proj_layer(x)
-
-        return x, mask, layer_results, att_maps
+            
+        return x, mask, layer_results, att_maps, encoder_output_original
 
     def get_intermediate_outputs(
         self, x: Tensor, supervisions: Optional[Supervisions] = None
@@ -217,7 +221,6 @@ class Conformer(Transformer):
                     projected_embeddings.append(layer_output)
         else:
             projected_embeddings = layer_outputs
-            
         return projected_embeddings
 
 
@@ -1040,7 +1043,8 @@ def compute_distillation_loss(
     if knowledge_lens is not None:
         seq_len, batch_size = teacher_out.size(0), teacher_out.size(1)
         mask = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
-        for i, length in enumerate(knowledge_lens):
+        # Ensure we don't iterate beyond batch_size
+        for i, length in enumerate(knowledge_lens[:batch_size]):
             if isinstance(length, torch.Tensor):
                 length = length.item()
             mask[i, :min(length, seq_len)] = True
@@ -1051,12 +1055,43 @@ def compute_distillation_loss(
     # Apply mask and compute loss
     if loss_type == "mse":
         loss = torch.nn.functional.mse_loss(student_out[mask], teacher_out[mask], reduction='mean')
+        
+        # Debug logging for MSE
+        if torch.rand(1).item() < 0.01:  # Log 1% of cases
+            loss_magnitude = loss.item()
+            logging.debug(f"MSE loss debug: magnitude={loss_magnitude:.6f}")
+            
     elif loss_type == "cos":
         # Cosine similarity loss: 1 - cosine_similarity
         teacher_flat = teacher_out[mask]  # (valid_frames, D)
         student_flat = student_out[mask]  # (valid_frames, D)
-        cos_sim = torch.nn.functional.cosine_similarity(teacher_flat, student_flat, dim=-1)
+        
+        # Ensure we have valid vectors (non-zero norm)
+        teacher_norm = torch.norm(teacher_flat, dim=-1, keepdim=True)
+        student_norm = torch.norm(student_flat, dim=-1, keepdim=True)
+        
+        # Add small epsilon to avoid division by zero
+        eps = 1e-8
+        teacher_normalized = teacher_flat / (teacher_norm + eps)
+        student_normalized = student_flat / (student_norm + eps)
+        
+        # Compute cosine similarity for each frame pair
+        cos_sim = torch.sum(teacher_normalized * student_normalized, dim=-1)  # (valid_frames,)
+        
+        # Clamp to valid range [-1, 1] to handle numerical issues
+        cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
+        
+        # Convert to loss: 1 - cosine_similarity (range: [0, 2])
         loss = 1.0 - cos_sim.mean()
+        
+        # Debug logging for Cosine
+        if torch.rand(1).item() < 0.01:  # Log 1% of cases
+            loss_magnitude = loss.item()
+            avg_cos_sim = cos_sim.mean().item()
+            logging.debug(f"Cosine loss debug: avg_cos_sim={avg_cos_sim:.6f}, loss={loss_magnitude:.6f}")
+            if loss_magnitude > 2.0 or loss_magnitude < 0.0:
+                logging.warning(f"Cosine loss out of expected range [0,2]: {loss_magnitude:.6f}")
+                
     elif loss_type == "kl":
         # Check if prototype-based KL divergence is requested
         if prototype_manager is not None and layer_idx is not None:
@@ -1069,10 +1104,21 @@ def compute_distillation_loss(
             if knowledge_lens is not None:
                 batch_size, seq_len = teacher_features.shape[:2]
                 frame_mask = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
-                for i, length in enumerate(knowledge_lens):
+                
+                # Debug logging to understand the dimension mismatch
+                logging.debug(f"DEBUG: batch_size={batch_size}, seq_len={seq_len}")
+                logging.debug(f"DEBUG: knowledge_lens length={len(knowledge_lens)}")
+                logging.debug(f"DEBUG: knowledge_lens values={knowledge_lens}")
+                
+                # Safe iteration - only process up to batch_size elements
+                for i, length in enumerate(knowledge_lens[:batch_size]):
                     if isinstance(length, torch.Tensor):
                         length = length.item()
                     frame_mask[i, :min(length, seq_len)] = True
+                    
+                # Warn if there's a dimension mismatch
+                if len(knowledge_lens) != batch_size:
+                    logging.warning(f"knowledge_lens length ({len(knowledge_lens)}) != batch_size ({batch_size}). Using first {batch_size} elements.")
             else:
                 frame_mask = None
             
@@ -1130,6 +1176,35 @@ def compute_distillation_loss(
                 loss = torch.clamp(loss, min=0.0)
     else:
         raise ValueError(f"Unsupported loss_type: {loss_type}")
+    
+    # Apply auto-scaling for all distillation loss types
+    # Different loss types may have very different magnitude ranges
+    loss_magnitude = loss.item()
+    scale_factor = 1.0
+    
+    # Auto-scaling threshold and target
+    min_threshold = 1e-5
+    max_threshold = 1e2  # Prevent extremely large losses
+    
+    # Log original values for analysis (1% of cases)
+    if torch.rand(1).item() < 0.01:
+        logging.info(f"Distillation loss analysis - {loss_type}: original={loss_magnitude:.6f}")
+    
+    if loss_magnitude > 0:
+        if loss_magnitude < min_threshold:
+            # Scale up small losses
+            scale_factor = min_threshold / loss_magnitude
+            loss = loss * scale_factor
+            if torch.rand(1).item() < 0.01:  # Log 1% of cases
+                logging.info(f"Auto-scaled {loss_type} loss UP by {scale_factor:.1e}: "
+                           f"{loss_magnitude:.2e} -> {loss.item():.2e}")
+        elif loss_magnitude > max_threshold:
+            # Scale down large losses
+            scale_factor = max_threshold / loss_magnitude
+            loss = loss * scale_factor
+            if torch.rand(1).item() < 0.01:  # Log 1% of cases
+                logging.info(f"Auto-scaled {loss_type} loss DOWN by {scale_factor:.1e}: "
+                           f"{loss_magnitude:.2e} -> {loss.item():.2e}")
     
     return loss
 
@@ -1228,6 +1303,19 @@ def compute_multi_layer_distillation_loss(
             loss = torch.stack(losses).sum()
             # Optional: normalize by sum of weights for weighted average
             # loss = loss / sum(weights)  # Uncomment for weighted average instead of weighted sum
+            
+            # Auto-scaling to ensure reasonable gradient magnitudes
+            # Scale up the loss if it's too small (< 1e-5) to ensure effective learning
+            loss_magnitude = loss.item()
+            scale_factor = 1.0
+            if loss_magnitude > 0 and loss_magnitude < 1e-5:
+                scale_factor = 1e-5 / loss_magnitude
+                loss = loss * scale_factor
+                logging.info(f"Auto-scaled distillation loss by {scale_factor:.1e}: "
+                           f"{loss_magnitude:.2e} -> {loss.item():.2e}")
+            
+            # Log the final loss value for monitoring
+            logging.debug(f"Final distillation loss: {loss.item():.6f} (scale_factor: {scale_factor:.1e})")
         else:
             loss = torch.tensor(0.0, device=device, requires_grad=True)
     else:

@@ -116,38 +116,55 @@ class PrototypeKMeansManager:
                 if total_samples >= num_samples:
                     break
                 
-                # Handle different batch structures
-                if isinstance(batch, dict):
-                    if 'clean' in batch and 'inputs' in batch['clean']:
-                        # Self-distillation format with clean/noisy
-                        feature = batch['clean']['inputs'].to(self.device)
-                        supervisions = batch['clean']['supervisions']
-                    elif 'inputs' in batch:
-                        # Standard format
-                        feature = batch['inputs'].to(self.device)
-                        supervisions = batch['supervisions']
-                    elif 'feature' in batch:
-                        # Legacy format
-                        feature = batch['feature'].to(self.device)
-                        feature_lens = batch['feature_lens'].to(self.device)
-                    else:
-                        logging.warning(f"Unknown batch format. Keys: {list(batch.keys())}")
-                        continue
+                if 'clean' in batch and 'inputs' in batch['clean']:
+                    # Self-distillation format with clean/noisy
+                    feature = batch['clean']['inputs'].to(self.device)
+                    supervisions = batch['clean']['supervisions']
+                    if batch_idx % 10 == 0:
+                        logging.info(f"DEBUG batch_{batch_idx}: Using clean/noisy format")
+                elif 'inputs' in batch:
+                    # Standard format
+                    feature = batch['inputs'].to(self.device)
+                    supervisions = batch['supervisions']
+                    if batch_idx % 10 == 0:
+                        logging.info(f"DEBUG batch_{batch_idx}: Using standard format")
+                elif 'feature' in batch:
+                    # Legacy format
+                    feature = batch['feature'].to(self.device)
+                    feature_lens = batch['feature_lens'].to(self.device)
+                    if batch_idx % 10 == 0:
+                        logging.info(f"DEBUG batch_{batch_idx}: Using legacy format")
                 else:
-                    # Tuple format
-                    feature, feature_lens = batch[0].to(self.device), batch[1].to(self.device)
+                    logging.warning(f"Unknown batch format. Keys: {list(batch.keys())}")
+                    continue
                 
-                # Get feature lengths from supervisions if available
-                if 'supervisions' in locals() and 'num_frames' in supervisions:
+                # Determine per-utterance feature lengths.
+                # If the incoming batch provided "supervisions", it may be in
+                # a segment-based format (multiple segments per recording) so
+                # we only reuse its 'num_frames' if it matches the batch size.
+                if (
+                    'supervisions' in locals()
+                    and 'num_frames' in supervisions
+                    and isinstance(supervisions['num_frames'], (list, tuple, torch.Tensor))
+                    and len(supervisions['num_frames']) == feature.size(0)
+                ):
+                    # Safe to reuse per-utterance lengths
                     if isinstance(supervisions['num_frames'], torch.Tensor):
+                        logging.info("supervision['num_frames'] is already torch tensor")
                         feature_lens = supervisions['num_frames'].to(self.device)
                     else:
+                        logging.info("supervision['num_frames'] is not torch tensor")
                         feature_lens = torch.tensor(supervisions['num_frames'], device=self.device)
-                elif 'feature_lens' not in locals():
-                    # Fallback: use actual feature sequence length
+                    
+                    if batch_idx % 10 == 0:
+                        logging.info(f"DEBUG batch_{batch_idx}: Reusing supervision num_frames, len={len(supervisions['num_frames'])}")
+                else:
+                    # Fallback: use actual feature sequence length for each example
                     feature_lens = torch.full((feature.size(0),), feature.size(1), device=self.device)
-            with torch.no_grad():
-                # Create proper supervision format for the model
+
+                # Create a simple per-utterance supervision dict (one segment per
+                # utterance) so encoder_padding_mask can compute lengths without
+                # relying on more complex segment structures.
                 supervisions = {
                     'sequence_idx': torch.arange(feature.size(0), device=self.device),
                     'start_frame': torch.zeros(feature.size(0), device=self.device),
@@ -155,27 +172,80 @@ class PrototypeKMeansManager:
                     'text': [''] * feature.size(0),  # Empty text for LibriLight
                 }
                 
-                # Forward through teacher to get layer output
-                # This assumes the teacher model can output intermediate layers
-                if hasattr(teacher_model, 'extract_layer_features'):
-                    layer_output = teacher_model.extract_layer_features(feature, supervisions, layer_idx)
-                else:
-                    # Fallback: forward through model and extract from hooks
-                    outputs = teacher_model(feature, supervisions)
-                    if isinstance(outputs, dict) and f'layer_{layer_idx}' in outputs:
-                        layer_output = outputs[f'layer_{layer_idx}']
+                outputs = teacher_model(feature, supervisions)
+
+                if len(outputs) >= 4 and outputs[3] is not None:
+                    # Use layer_results if available
+                    layer_results = outputs[3]
+                    layer_output = layer_results[layer_idx]
+                                            
+                # If model returned a tuple/list (some forwards return multiple
+                # values), try to pick the first tensor-like object.
+                if not isinstance(layer_output, torch.Tensor):
+                    if isinstance(layer_output, (list, tuple)):
+                        found = False
+                        for item in layer_output:
+                            if isinstance(item, torch.Tensor):
+                                layer_output = item
+                                found = True
+                                break
+                        if not found:
+                            logging.error(f"layer_output is not a tensor and no tensor found inside: {type(layer_output)}")
+                            continue  # Skip this batch
                     else:
-                        logging.warning(f"Could not extract layer {layer_idx} features. Using final output.")
-                        layer_output = outputs if not isinstance(outputs, dict) else outputs.get('encoder_out', outputs['logits'])
+                        logging.error(f"layer_output is not a tensor: {type(layer_output)}")
+                        continue  # Skip this batch
+                
+                # layer_output should be (T, N, C) format, but might be (N, T, C)
+                if layer_output.dim() != 3:
+                    logging.error(f"layer_output has wrong dimensions: {layer_output.shape}")
+                    continue  # Skip this batch
+                
+                # Check if we need to transpose from (N, T, C) to (T, N, C)
+                if layer_output.size(0) == feature.size(0):  # Batch size matches first dimension
+                    layer_output = layer_output.transpose(0, 1)  # (N, T, C) -> (T, N, C)
                 
                 # Apply feature length masking
                 batch_size = layer_output.size(1)
+                
+                # Estimate number of batches for sampling distribution
+                # Check sampler attributes directly without try-except
+                sampler = dataloader.sampler
+                if hasattr(sampler, 'num_cuts') and sampler.num_cuts is not None:
+                    # SimpleCutSampler has num_cuts attribute
+                    n_batches = max(1, (sampler.num_cuts + batch_size - 1) // batch_size)
+                elif hasattr(sampler, '__len__'):
+                    try:
+                        sampler_len = len(sampler)
+                        n_batches = max(1, (sampler_len + batch_size - 1) // batch_size)
+                    except:
+                        # Fallback if len() fails
+                        n_batches = max(100, num_samples // (batch_size * 10))
+                else:
+                    # Conservative fallback for even sampling distribution
+                    n_batches = max(100, num_samples // (batch_size * 10))
+
                 for b in range(batch_size):
-                    valid_len = feature_lens[b].item()
-                    valid_features = layer_output[b, :valid_len]  # [T, D]
+                    # Safe feature length access with bounds checking
+                    if b >= len(feature_lens):
+                        logging.warning(f"batch index {b} >= feature_lens length {len(feature_lens)}, using last available length")
+                        valid_len = feature_lens[-1].item() if len(feature_lens) > 0 else layer_output.size(0)
+                    else:
+                        valid_len = feature_lens[b].item()
                     
+                    # Ensure valid_len doesn't exceed tensor dimensions
+                    max_len = layer_output.size(0)
+                    valid_len = min(valid_len, max_len)
+                    
+                    # Safe tensor slicing with bounds checking
+                    if valid_len <= 0:
+                        logging.warning(f"Invalid valid_len {valid_len}, skipping batch {b}")
+                        continue
+                        
+                    valid_features = layer_output[:valid_len, b]  # [T, D]
+
                     # Sample random frames from this utterance
-                    num_frames = min(valid_len, max(1, num_samples // len(dataloader) // batch_size))
+                    num_frames = min(valid_len, max(1, num_samples // max(1, n_batches) // max(1, batch_size)))
                     if valid_len > num_frames:
                         indices = torch.randperm(valid_len)[:num_frames]
                         sampled_features = valid_features[indices]
@@ -187,9 +257,14 @@ class PrototypeKMeansManager:
                     
                     if total_samples >= num_samples:
                         break
-                
+
+                # Progress logging (outside try-except block)
                 if batch_idx % 100 == 0:
                     logging.info(f"Processed {batch_idx} batches, collected {total_samples} samples")
+        
+        # Check if we collected any features
+        if not features_list:
+            raise RuntimeError(f"No features collected for layer {layer_idx}. Check dataloader and model compatibility.")
         
         # Concatenate all features
         features = np.vstack(features_list)

@@ -186,13 +186,14 @@ class Transformer(nn.Module):
             x = x.permute(0, 2, 1)  # (N, C, T) -> (N, T, C)
         if isinstance(self.use_feat_batchnorm, float):
             x *= self.use_feat_batchnorm
-        encoder_memory, memory_key_padding_mask, layer_results, att_maps = self.run_encoder(x, supervision)
-        x = self.ctc_output(encoder_memory)
+        encoder_memory, memory_key_padding_mask, layer_results, att_maps, encoder_output_original = self.run_encoder(x, supervision)
+        # Use original encoder output (256-dim) for CTC, not projected output
+        x = self.ctc_output(encoder_output_original)
         return x, encoder_memory, memory_key_padding_mask, layer_results, att_maps
 
     def run_encoder(
         self, x: torch.Tensor, supervisions: Optional[Supervisions] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
         """Run the transformer encoder.
 
         Args:
