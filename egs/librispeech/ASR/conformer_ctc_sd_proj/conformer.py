@@ -151,15 +151,19 @@ class Conformer(Transformer):
             
         layer_results = None
         att_maps = None
-        x, layer_results, att_maps = self.encoder(x, pos_emb, src_key_padding_mask=mask)  # (T, B, F)
+        x, layer_results, att_maps = self.encoder(x, pos_emb, src_key_padding_mask=mask)  # (T, B, F) 확인 on 10/31
 
         if self.normalize_before:
             x = self.after_norm(x)
         
+        # Keep original encoder output for CTC (256-dim)
+        encoder_output_original = x
+        
+        # Apply projection for distillation (128-dim)
         if self.use_proj_layer:
             x = self.proj_layer(x)
-
-        return x, mask, layer_results, att_maps
+            
+        return x, mask, layer_results, att_maps, encoder_output_original
 
     def get_intermediate_outputs(
         self, x: Tensor, supervisions: Optional[Supervisions] = None
@@ -217,7 +221,6 @@ class Conformer(Transformer):
                     projected_embeddings.append(layer_output)
         else:
             projected_embeddings = layer_outputs
-            
         return projected_embeddings
 
 
@@ -1040,7 +1043,8 @@ def compute_distillation_loss(
     if knowledge_lens is not None:
         seq_len, batch_size = teacher_out.size(0), teacher_out.size(1)
         mask = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
-        for i, length in enumerate(knowledge_lens):
+        # Ensure we don't iterate beyond batch_size
+        for i, length in enumerate(knowledge_lens[:batch_size]):
             if isinstance(length, torch.Tensor):
                 length = length.item()
             mask[i, :min(length, seq_len)] = True
@@ -1069,10 +1073,21 @@ def compute_distillation_loss(
             if knowledge_lens is not None:
                 batch_size, seq_len = teacher_features.shape[:2]
                 frame_mask = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
-                for i, length in enumerate(knowledge_lens):
+                
+                # Debug logging to understand the dimension mismatch
+                logging.debug(f"DEBUG: batch_size={batch_size}, seq_len={seq_len}")
+                logging.debug(f"DEBUG: knowledge_lens length={len(knowledge_lens)}")
+                logging.debug(f"DEBUG: knowledge_lens values={knowledge_lens}")
+                
+                # Safe iteration - only process up to batch_size elements
+                for i, length in enumerate(knowledge_lens[:batch_size]):
                     if isinstance(length, torch.Tensor):
                         length = length.item()
                     frame_mask[i, :min(length, seq_len)] = True
+                    
+                # Warn if there's a dimension mismatch
+                if len(knowledge_lens) != batch_size:
+                    logging.warning(f"knowledge_lens length ({len(knowledge_lens)}) != batch_size ({batch_size}). Using first {batch_size} elements.")
             else:
                 frame_mask = None
             
@@ -1228,6 +1243,19 @@ def compute_multi_layer_distillation_loss(
             loss = torch.stack(losses).sum()
             # Optional: normalize by sum of weights for weighted average
             # loss = loss / sum(weights)  # Uncomment for weighted average instead of weighted sum
+            
+            # Auto-scaling to ensure reasonable gradient magnitudes
+            # Scale up the loss if it's too small (< 1e-5) to ensure effective learning
+            loss_magnitude = loss.item()
+            scale_factor = 1.0
+            if loss_magnitude > 0 and loss_magnitude < 1e-5:
+                scale_factor = 1e-5 / loss_magnitude
+                loss = loss * scale_factor
+                logging.info(f"Auto-scaled distillation loss by {scale_factor:.1e}: "
+                           f"{loss_magnitude:.2e} -> {loss.item():.2e}")
+            
+            # Log the final loss value for monitoring
+            logging.debug(f"Final distillation loss: {loss.item():.6f} (scale_factor: {scale_factor:.1e})")
         else:
             loss = torch.tensor(0.0, device=device, requires_grad=True)
     else:

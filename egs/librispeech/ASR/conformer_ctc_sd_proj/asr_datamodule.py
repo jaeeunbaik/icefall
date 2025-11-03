@@ -976,8 +976,8 @@ class LibriLightAsrDataModule(LibriSpeechAsrDataModule):
         group.add_argument(
             "--enable-librilight-chunking",
             type=str2bool,
-            default=True,
-            help="Split long LibriLight cuts into smaller chunks"
+            default=False,  # Changed to False for faster loading
+            help="Split long LibriLight cuts into smaller chunks (disabled by default for speed)"
         )
 
     def __init__(self, args: argparse.Namespace):
@@ -994,7 +994,7 @@ class LibriLightAsrDataModule(LibriSpeechAsrDataModule):
 
     @lru_cache()
     def librilight_train_cuts(self) -> CutSet:
-        """Load LibriLight training cuts with optional chunking and sampling."""
+        """Load LibriLight training cuts efficiently."""
         subset = self.args.librilight_subset
         logging.info(f"Loading LibriLight {subset} training cuts")
         
@@ -1013,43 +1013,53 @@ class LibriLightAsrDataModule(LibriSpeechAsrDataModule):
                 f"Please prepare LibriLight manifests first using prepare_librilight.sh"
             )
         
+        logging.info(f"Loading cuts from {cuts_path}")
         cuts = load_manifest_lazy(cuts_path)
-        logging.info(f"Loaded {len(cuts)} LibriLight {subset} training cuts")
+        logging.info(f"Successfully loaded {len(cuts)} LibriLight {subset} training cuts")
         
-        # Apply chunking if enabled (LibriLight has very long utterances)
-        if self.args.enable_librilight_chunking:
-            max_duration = self.args.librilight_max_duration_per_cut
-            logging.info(f"Chunking LibriLight cuts to max {max_duration}s per cut")
+        # Apply optional chunking and sampling only if explicitly enabled
+        if hasattr(self.args, 'enable_librilight_chunking') and self.args.enable_librilight_chunking:
+            cuts = self._apply_chunking(cuts)
             
-            chunked_cuts = []
-            for cut in cuts:
-                if cut.duration > max_duration:
-                    # Split long cuts into chunks
-                    num_chunks = int(cut.duration / max_duration) + 1
-                    chunk_duration = cut.duration / num_chunks
+        if hasattr(self.args, 'librilight_sampling_ratio') and self.args.librilight_sampling_ratio < 1.0:
+            cuts = self._apply_sampling(cuts)
+        
+        return cuts
+    
+    def _apply_chunking(self, cuts: CutSet) -> CutSet:
+        """Apply chunking to long LibriLight cuts."""
+        max_duration = getattr(self.args, 'librilight_max_duration_per_cut', 20.0)
+        logging.info(f"Chunking LibriLight cuts to max {max_duration}s per cut")
+        
+        chunked_cuts = []
+        for cut in cuts:
+            if cut.duration > max_duration:
+                # Split long cuts into chunks
+                num_chunks = int(cut.duration / max_duration) + 1
+                chunk_duration = cut.duration / num_chunks
+                
+                for i in range(num_chunks):
+                    start = i * chunk_duration
+                    end = min((i + 1) * chunk_duration, cut.duration)
                     
-                    for i in range(num_chunks):
-                        start = i * chunk_duration
-                        end = min((i + 1) * chunk_duration, cut.duration)
-                        
-                        # Create chunk using truncate with proper supervision handling
-                        chunk = cut.truncate(offset=start, duration=end-start, keep_excessive_supervisions=False)
-                        chunk.id = f"{cut.id}_chunk_{i:03d}"
-                        chunked_cuts.append(chunk)
-                else:
-                    chunked_cuts.append(cut)
-            
-            cuts = CutSet.from_cuts(chunked_cuts)
-            logging.info(f"After chunking: {len(cuts)} cuts")
+                    # Create chunk using truncate with proper supervision handling
+                    chunk = cut.truncate(offset=start, duration=end-start, keep_excessive_supervisions=False)
+                    chunk.id = f"{cut.id}_chunk_{i:03d}"
+                    chunked_cuts.append(chunk)
+            else:
+                chunked_cuts.append(cut)
         
-        # Apply sampling if ratio < 1.0
+        cuts = CutSet.from_cuts(chunked_cuts)
+        logging.info(f"After chunking: {len(cuts)} cuts")
+        return cuts
+    
+    def _apply_sampling(self, cuts: CutSet) -> CutSet:
+        """Apply sampling to reduce LibriLight dataset size."""
         sampling_ratio = self.args.librilight_sampling_ratio
-        if sampling_ratio < 1.0:
-            original_size = len(cuts)
-            subset_size = int(original_size * sampling_ratio)
-            cuts = cuts.subset(first=subset_size)
-            logging.info(f"Sampled {len(cuts)}/{original_size} cuts (ratio: {sampling_ratio})")
-        
+        original_size = len(cuts)
+        subset_size = int(original_size * sampling_ratio)
+        cuts = cuts.subset(first=subset_size)
+        logging.info(f"Sampled {len(cuts)}/{original_size} cuts (ratio: {sampling_ratio})")
         return cuts
 
     @lru_cache()
@@ -1058,9 +1068,32 @@ class LibriLightAsrDataModule(LibriSpeechAsrDataModule):
         subset = self.args.librilight_subset
         logging.info(f"Loading LibriLight {subset} development cuts")
         
-        # LibriLight doesn't have standard dev set, use LibriSpeech dev sets
-        logging.info("Using LibriSpeech dev-clean as validation for LibriLight")
-        return self.dev_clean_cuts()
+        # Try to load pre-saved LibriLight dev cuts first
+        manifest_file = f"librilight_{subset}_cuts_dev.jsonl.gz"
+        cuts_path = self.librilight_manifest_dir / manifest_file
+        
+        if cuts_path.exists():
+            logging.info(f"Loading pre-saved LibriLight dev cuts from {cuts_path}")
+            cuts = load_manifest_lazy(cuts_path)
+            logging.info(f"Loaded {len(cuts)} LibriLight {subset} dev cuts")
+            return cuts
+        
+        # Fallback: Use LibriSpeech dev-clean (but cache it for future use)
+        logging.info("LibriLight dev cuts not found. Using LibriSpeech dev-clean as validation")
+        logging.info("This will be cached for future use")
+        
+        # Load LibriSpeech dev-clean
+        dev_cuts = self.dev_clean_cuts()
+        
+        # Save for future use
+        try:
+            logging.info(f"Saving LibriLight dev cuts to {cuts_path} for future use")
+            dev_cuts.to_file(cuts_path)
+            logging.info(f"Successfully saved {len(dev_cuts)} dev cuts")
+        except Exception as e:
+            logging.warning(f"Failed to save LibriLight dev cuts: {e}")
+        
+        return dev_cuts
 
     def train_dataloaders(
         self,

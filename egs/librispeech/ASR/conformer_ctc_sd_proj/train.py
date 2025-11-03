@@ -858,7 +858,7 @@ def compute_loss(
                 
 
         else:
-            if params.learning-type == "asr":
+            if params.learning_type == "asr":
                 logging.debug("Self-distillation disabled (learning-type=asr)")
             elif clean_feature is None:
                 logging.warning("Clean feature is None, skipping self-distillation")
@@ -894,20 +894,22 @@ def compute_loss(
     # Add self-distillation loss with proper scale matching
     if params.learning_type == "encoder-only":
         total_loss = distillation_loss
-        logging.debug(f"encoder only trainig"
-                      f"distill_loss={distillation_loss:.4f}")
+        logging.debug(f"encoder only training: "
+                      f"distill_loss={distillation_loss.item():.4f}")
         
     elif params.learning_type == "hybrid" and distillation_loss.item() > 0:
         # With reduction='mean', CTC loss scale is more manageable
         total_loss = total_loss + params.alpha * distillation_loss
-        logging.debug(f"Loss combination: ctc_loss={total_loss-params.alpha*distillation_loss:.4f}, "
-                     f"distill_loss={distillation_loss:.4f}, alpha={params.alpha}, "
-                     f"total_loss={total_loss:.4f}")
+        logging.debug(f"Loss combination: ctc_loss={(total_loss-params.alpha*distillation_loss).item():.4f}, "
+                     f"distill_loss={distillation_loss.item():.4f}, alpha={params.alpha}, "
+                     f"total_loss={total_loss.item():.4f}")
     
     elif params.learning_type == "asr":
-        logging.debug(f"Loss combination: ctc_loss={ctc_loss:.4f}, "
-                    f"att_loss={att_loss:.4f}, att_rate={params.att_rate}, "
-                    f"total_loss={total_loss:.4f}")
+        # For ASR mode, use only CTC + attention losses (no distillation)
+        # total_loss is already set above to ctc_loss or (ctc_loss + att_loss)
+        logging.debug(f"ASR training - Loss combination: ctc_loss={ctc_loss.item():.4f}, "
+                    f"att_loss={att_loss.item():.4f}, att_rate={params.att_rate}, "
+                    f"total_loss={total_loss.item():.4f}")
 
     assert total_loss.requires_grad == is_training
 
