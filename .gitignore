@@ -36,4 +36,8 @@ node_modules
 .DS_Store
 *.fst
 *.arpa
+events.out.*
 *.sh
+*.pkl
+*.code-workspace
+launch.json

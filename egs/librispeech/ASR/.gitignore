@@ -5,4 +5,11 @@ exp*/
 e.dataset.sampling.cut_samplers import SimpleCutSampler
 *.log
 *.sh
-events.out*
+events.out.*
+*.pkl
+*.lca
+*.jsonl.gz
+*.done
+*.model
+*.vocab
+*.scp

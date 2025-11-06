@@ -41,9 +41,11 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 import sentencepiece as spm
-from asr_datamodule import LibriSpeechAsrDataModule
+from asr_datamodule import LibriSpeechAsrDataModule, LibriLightAsrDataModule
 from conformer import Conformer
 from ema_teacher import EMATeacher
+from k_means_clustering import PrototypeKMeansManager
+from k_means_clustering import PrototypeKMeansManager
 from lhotse.cut import Cut
 from lhotse.utils import fix_random_seed
 from torch import Tensor
@@ -152,7 +154,7 @@ def get_parser():
     parser.add_argument(
         "--att-rate",
         type=float,
-        default=0.8,
+        default=0.0,
         help="""The attention rate.
         The total loss is (1 -  att_rate) * ctc_loss + att_rate * att_loss
         """,
@@ -278,6 +280,7 @@ def get_parser():
              "'output_avg' computes loss for each layer and averages them.",
     )
     
+<<<<<<< HEAD
     parser.add_argument(
         "--clean-ratio",
         type=float,
@@ -294,6 +297,8 @@ def get_parser():
              "'encoder-output' uses intermediate encoder layer outputs, "
              "'attention-map' uses attention weights from self-attention layers.",
     )
+=======
+>>>>>>> master
     
     parser.add_argument(
         "--distill-temperature",
@@ -301,6 +306,16 @@ def get_parser():
         default=1.0,
         help="Temperature for attention map distillation (used with KL divergence). "
              "Higher values make attention distributions smoother.",
+    )
+    
+    parser.add_argument(
+        "--layer-weights",
+        type=str,
+        default=None,
+        help="Comma-separated weights for each distillation layer loss. "
+             "Should match the number of layers in --distill-layers. "
+             "Example: '0.5,0.7,1.0' for three layers. "
+             "If not provided, all layers get equal weights (1.0).",
     )
     
     # EMA Teacher Model Arguments
@@ -386,11 +401,48 @@ def get_parser():
     )
     
     parser.add_argument(
-        "--proj-layer-training",
+        "--learning-type",
+        default="encoder-only",
+        choices=["encoder-only", "hybrid", "asr"],
+        help="""Training method, encoder-only for training only encoder, hybrid when loss is weighted sum of self-distillation and asr
+        asr when training loss is only composed of asr loss
+        """
+    )
+    
+    parser.add_argument(
+        "--clean-ratio",
+        type=float,
+        default=0.3,
+    )
+    
+    parser.add_argument(
+        "--dataset-type",
         type=str,
-        default="full-finetuning",
-        choices=["full-finetuning", "only-proj"],
-        help="Training method for self distillation: 'full-finetuning' for fine-tuning all parameters, 'only-proj' for training only proj layer, else freezed.",
+        default="auto",
+        choices=["auto", "librispeech", "librilight"],
+        help="Dataset type to use. 'auto' selects LibriLight for encoder-only mode, LibriSpeech otherwise.",
+    )
+    
+    # Prototype-based KL divergence arguments
+    parser.add_argument(
+        "--prototype-dir",
+        type=str,
+        default="./prototypes",
+        help="Directory to save/load prototypes. If directory doesn't exist, prototypes will be initialized.",
+    )
+    
+    parser.add_argument(
+        "--num-prototypes",
+        type=int,
+        default=256,
+        help="Number of prototypes per layer for KL-based distillation (K value for K-means)",
+    )
+    
+    parser.add_argument(
+        "--prototype-samples",
+        type=int,
+        default=100000,
+        help="Number of feature samples per layer for prototype initialization using K-means",
     )
     
     return parser
@@ -525,7 +577,7 @@ def load_checkpoint_if_available(
     models_dir = params.exp_dir / "models"
 
     # If resume-from is set, use that path directly
-    resume_path = getattr(params, "resume_from", None)
+    resume_path = params.resume_from
     if resume_path:
         filename = Path(resume_path)
         if not filename.exists():
@@ -672,9 +724,10 @@ def compute_loss(
     graph_compiler: BpeCtcTrainingGraphCompiler,
     is_training: bool,
     ema_teacher: Optional[EMATeacher] = None,
+    prototype_manager: Optional[PrototypeKMeansManager] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
-    Compute CTC loss with optional self-distillation.
+    Compute loss optimized by learning-type to avoid unnecessary computations.
 
     Args:
       params:
@@ -690,178 +743,132 @@ def compute_loss(
         True for training. False for validation.
     """
     device = graph_compiler.device
-    
-    # Handle clean-noisy batch structure for self-distillation
-    if 'clean' in batch and 'noisy' in batch and params.enable_self_distillation:
-        # Self-distillation mode with clean-noisy samples
-        clean_feature = batch['clean']['inputs']
-        noisy_feature = batch['noisy']['inputs']
-        clean_supervisions = batch['clean']['supervisions']
-        noisy_supervisions = batch['noisy']['supervisions']
-        
-        # Use noisy samples as primary for CTC loss computation
-        feature = noisy_feature
-        supervisions = noisy_supervisions
-        
-        # Note: We'll move to the correct device later after getting model device
-        use_self_distillation = True
-        # Clean-noisy pairs are being used for self-distillation
-    else:
-        # Normal mode or self-distillation disabled
-        feature = batch["inputs"]
-        supervisions = batch["supervisions"]
-        # Note: We'll move to the correct device later after getting model device
-        
-        clean_feature = None
-        noisy_feature = None
-        clean_supervisions = None
-        use_self_distillation = False
-    
-    # at entry, feature is (N, T, C)
-    assert feature.ndim == 3
-    
-    # Ensure model and feature are on the same device
     model_device = next(model.parameters()).device
     
-    # Move feature to the correct device if needed
-    if feature.device != model_device:
-        feature = feature.to(model_device)
+    # Initialize metrics for tracking
+    info = MetricsTracker()
     
-    # Also move clean_feature if it exists
-    if clean_feature is not None and clean_feature.device != model_device:
-        clean_feature = clean_feature.to(model_device)
-    t_output = None
+    # Early branch based on learning_type to optimize computation
+    if params.learning_type == "encoder-only":
+        return _compute_encoder_only_loss(
+            params, model, batch, graph_compiler, is_training, 
+            ema_teacher, prototype_manager, device, model_device, info
+        )
+    elif params.learning_type == "hybrid":
+        return _compute_hybrid_loss(
+            params, model, batch, graph_compiler, is_training,
+            ema_teacher, prototype_manager, device, model_device, info
+        )
+    elif params.learning_type == "asr":
+        return _compute_asr_only_loss(
+            params, model, batch, graph_compiler, is_training,
+            device, model_device, info
+        )
+    else:
+        raise ValueError(f"Unknown learning_type: {params.learning_type}")
+
+
+def _compute_encoder_only_loss(
+    params: AttributeDict,
+    model: nn.Module,
+    batch: dict,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
+    is_training: bool,
+    ema_teacher: Optional[EMATeacher],
+    prototype_manager: Optional[PrototypeKMeansManager],
+    device,
+    model_device,
+    info: MetricsTracker,
+) -> Tuple[Tensor, MetricsTracker]:
+    """Compute only distillation loss for encoder-only training."""
+    
+    # Handle clean-noisy batch structure
+    if 'clean' not in batch or 'noisy' not in batch:
+        raise ValueError("encoder-only mode requires clean-noisy batch structure")
+    
+    clean_feature = batch['clean']['inputs'].to(model_device)
+    noisy_feature = batch['noisy']['inputs'].to(model_device)
+    clean_supervisions = batch['clean']['supervisions']
+    noisy_supervisions = batch['noisy']['supervisions']
+    
+    assert clean_feature.ndim == 3 and noisy_feature.ndim == 3
+    
     with torch.set_grad_enabled(is_training):
-        # Forward pass through model (noisy sample)
-        nnet_output, encoder_memory, memory_mask, hiddens, att_maps = model(feature, supervisions)
+        # Student forward pass (noisy sample)
+        _, _, _, _, _ = model(noisy_feature, noisy_supervisions)
         
-        # Get the original lengths from supervisions
-        if isinstance(supervisions, dict) and 'num_frames' in supervisions:
-            original_lengths = supervisions['num_frames']
+        # Get output lengths for distillation
+        if isinstance(noisy_supervisions, dict) and 'num_frames' in noisy_supervisions:
+            original_lengths = noisy_supervisions['num_frames']
             if not isinstance(original_lengths, torch.Tensor):
                 original_lengths = torch.tensor(original_lengths, device=model_device)
-            # Apply subsampling factor to get actual output lengths
             output_lens = (original_lengths + params.subsampling_factor - 1) // params.subsampling_factor
-            output_lens = output_lens.cpu().tolist()  # Convert to list for distillation functions
+            output_lens = output_lens.cpu().tolist()
         else:
-            # Fallback: use actual nnet_output sequence lengths for each sample
-            batch_size = nnet_output.size(1)  # N from (T, N, C)
-            seq_len = nnet_output.size(0)     # T from (T, N, C) 
+            batch_size = clean_feature.size(0)
+            seq_len = clean_feature.size(1) // params.subsampling_factor
             output_lens = [seq_len] * batch_size
         
-        # Self-distillation computation
-        distillation_loss = torch.tensor(0.0, device=model_device)
+        # Teacher forward pass
+        if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+            teacher_model = ema_teacher.get_teacher_model()
+            with torch.no_grad():
+                teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
+        else:
+            with torch.no_grad():
+                teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
         
-        if use_self_distillation and params.enable_self_distillation and clean_feature is not None:
-            # Log only occasionally to reduce spam
-            if params.batch_idx_train % 1000 == 0:
-                logging.info(f"Self-distillation active: ema_teacher={ema_teacher is not None}, step={params.batch_idx_train}")
+        # Student projected outputs
+        student_projected_outputs = model.get_intermediate_outputs(noisy_feature, noisy_supervisions)
+        
+        # Compute distillation loss
+        if teacher_projected_outputs and student_projected_outputs:
+            from conformer import compute_multi_layer_distillation_loss
             
-            # Use EMA teacher model if available, otherwise use the same model with clean samples
-            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-                teacher_model = ema_teacher.get_teacher_model()
-                with torch.no_grad():
-                    t_output, _, _, t_hidden, t_maps = teacher_model(clean_feature, clean_supervisions)
-                if params.batch_idx_train % 1000 == 0:
-                    logging.info(f"Using EMA teacher model for distillation (step {params.batch_idx_train})")
-            else:
-                # 학습 초반부에 EMA 모델 없으면 student 모델로 계산
-                with torch.no_grad():
-                    t_output, _, _, t_hidden, t_maps = model(clean_feature, clean_supervisions)
-                if ema_teacher is not None and params.batch_idx_train % 1000 == 0:
-                    logging.info(f"EMA teacher exists but step {params.batch_idx_train} < start_step {params.ema_start_step}, using same model")
-                elif ema_teacher is None and params.batch_idx_train % 1000 == 0:
-                    logging.info(f"No EMA teacher, using same model with clean samples as teacher")
-            
-            # Parse distillation layers from comma-separated string
+            # Parse distillation layers
             try:
                 distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
             except:
                 distill_layers = [int(params.distill_layers)]
             
-            if params.knowledge == "encoder-output":
-                # Extract encoder outputs for distillation with projection layers
-                if params.use_proj_layer and len(distill_layers) > 0:
-                    # Use get_intermediate_outputs for projection-applied distillation layers
-                    if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-                        teacher_model = ema_teacher.get_teacher_model()
-                        with torch.no_grad():
-                            teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
-                    else:
-                        with torch.no_grad():
-                            teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
-                    
-                    # Get student projected outputs
-                    student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
-                    
-                    if teacher_projected_outputs and student_projected_outputs:
-                        from conformer import compute_multi_layer_distillation_loss
-                        distillation_loss = compute_multi_layer_distillation_loss(
-                            teacher_knowledge=teacher_projected_outputs,
-                            student_knowledge=student_projected_outputs,
-                            knowledge_lens=output_lens,
-                            layer_indices=list(range(len(distill_layers))),  # Use sequential indices since we already filtered layers
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                            aggregation=params.distill_aggregation,
-                        )
-                    else:
-                        logging.warning("Failed to get projected outputs for distillation")
-                        distillation_loss = torch.tensor(0.0, device=model_device)
-                
-                elif hiddens is not None and t_hidden is not None:
-                    # Fallback to original method when projection is disabled
-                    # Import the multi-layer distillation function
-                    from conformer import compute_multi_layer_distillation_loss
-                    
-                    if len(distill_layers) == 1:
-                        from conformer import compute_distillation_loss
-                        distillation_loss = compute_distillation_loss(
-                            teacher_knowledge=t_output,
-                            student_knowledge=nnet_output,
-                            knowledge_lens=output_lens,
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                        )
-                    else:
-                        from conformer import compute_multi_layer_distillation_loss
-                        distillation_loss = compute_multi_layer_distillation_loss(
-                            teacher_knowledge=t_hidden,
-                            student_knowledge=hiddens,
-                            knowledge_lens=output_lens,
-                            layer_indices=distill_layers,
-                            loss_type=params.distill_loss_type,
-                            knowledge_type="encoder-output",
-                            aggregation=params.distill_aggregation,
-                        )
-                    
-            elif params.knowledge == "attention-map":
-                # Extract attention maps for distillation
-                if att_maps is not None and t_maps is not None:
-                    
-                    # Import the multi-layer distillation function
-                    from conformer import compute_multi_layer_distillation_loss
-                    
-                    distillation_loss = compute_multi_layer_distillation_loss(
-                        teacher_knowledge=t_maps,
-                        student_knowledge=att_maps,
-                        knowledge_lens=output_lens,
-                        layer_indices=distill_layers,
-                        loss_type="kl",  # Always use KL divergence for attention maps
-                        knowledge_type="attention-map",
-                        aggregation=params.distill_aggregation,
-                        temperature=params.distill_temperature,
-                    )
-                    logging.debug(f"Attention-map distillation loss computed: {distillation_loss.item():.6f}")
-                else:
-                    logging.warning("Attention maps not found in model output. Distillation disabled for this batch.")
-                    distillation_loss = torch.tensor(0.0, device=model_device)
+            # Parse layer weights
+            layer_weights = None
+            if params.layer_weights is not None:
+                try:
+                    layer_weights = [float(x.strip()) for x in params.layer_weights.split(',')]
+                    if len(layer_weights) != len(distill_layers):
+                        layer_weights = None
+                except ValueError:
+                    layer_weights = None
+            
+            distillation_loss = compute_multi_layer_distillation_loss(
+                teacher_knowledge=teacher_projected_outputs,
+                student_knowledge=student_projected_outputs,
+                knowledge_lens=output_lens,
+                layer_indices=list(range(len(distill_layers))),
+                loss_type=params.distill_loss_type,
+                aggregation=params.distill_aggregation,
+                temperature=params.distill_temperature,
+                prototype_manager=prototype_manager,
+                target_layers=distill_layers,
+                layer_weights=layer_weights,
+            )
         else:
-            if not use_self_distillation:
-                logging.debug("Self-distillation disabled (use_self_distillation=False)")
-            elif clean_feature is None:
-                logging.warning("Clean feature is None, skipping self-distillation")
+            distillation_loss = torch.tensor(0.0, device=model_device, requires_grad=is_training)
+    
+    # Update metrics
+    info["frames"] = clean_feature.size(0) * clean_feature.size(1)  # Approximate
+    info["ctc_loss"] = 0.0  # Not computed in encoder-only mode
+    info["att_loss"] = 0.0  # Not computed in encoder-only mode
+    info["distill_loss"] = distillation_loss.detach().cpu().item()
+    info["loss"] = distillation_loss.detach().cpu().item()
+    info["utterances"] = clean_feature.size(0)
+    info["utt_duration"] = noisy_supervisions["num_frames"].sum().item() if isinstance(noisy_supervisions, dict) and 'num_frames' in noisy_supervisions else clean_feature.size(0) * clean_feature.size(1)
+    info["utt_pad_proportion"] = 0.0  # Approximate
+    
+    return distillation_loss, info
 
+<<<<<<< HEAD
     # NOTE: We need `encode_supervisions` to sort sequences with
     # different duration in decreasing order, required by
     # `k2.intersect_dense` called in `k2.ctc_loss`
@@ -869,56 +876,208 @@ def compute_loss(
     if t_output is not None:
         t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
         ctc_loss = params.clean_ratio * t_ctc_loss + (1.0-params.clean_ratio) * s_ctc_loss
+=======
+
+def _compute_hybrid_loss(
+    params: AttributeDict,
+    model: nn.Module,
+    batch: dict,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
+    is_training: bool,
+    ema_teacher: Optional[EMATeacher],
+    prototype_manager: Optional[PrototypeKMeansManager],
+    device,
+    model_device,
+    info: MetricsTracker,
+) -> Tuple[Tensor, MetricsTracker]:
+    """Compute CTC + distillation loss for hybrid training."""
+    
+    # Handle batch structure
+    if 'clean' in batch and 'noisy' in batch:
+        clean_feature = batch['clean']['inputs'].to(model_device)
+        noisy_feature = batch['noisy']['inputs'].to(model_device)
+        clean_supervisions = batch['clean']['supervisions']
+        noisy_supervisions = batch['noisy']['supervisions']
+        feature = noisy_feature
+        supervisions = noisy_supervisions
+>>>>>>> master
     else:
-        ctc_loss = s_ctc_loss
-
-
-
-    # Attention loss computation (if applicable)
-    if params.att_rate != 0.0:
-        with torch.set_grad_enabled(is_training):
+        feature = batch["inputs"].to(model_device)
+        supervisions = batch["supervisions"]
+        clean_feature = None
+        noisy_feature = None
+        clean_supervisions = None
+    
+    assert feature.ndim == 3
+    
+    with torch.set_grad_enabled(is_training):
+        # Forward pass
+        nnet_output, encoder_memory, memory_mask, _, _ = model(feature, supervisions)
+        
+        # Compute CTC loss
+        s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
+        
+        # Compute teacher CTC loss if clean samples available
+        t_output = None
+        if clean_feature is not None:
+            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+                teacher_model = ema_teacher.get_teacher_model()
+                with torch.no_grad():
+                    t_output, _, _, _, _ = teacher_model(clean_feature, clean_supervisions)
+            else:
+                with torch.no_grad():
+                    t_output, _, _, _, _ = model(clean_feature, clean_supervisions)
+                    
+            if t_output is not None:
+                t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
+                ctc_loss = params.clean_ratio * t_ctc_loss + (1 - params.clean_ratio) * s_ctc_loss
+            else:
+                ctc_loss = s_ctc_loss
+        else:
+            ctc_loss = s_ctc_loss
+        
+        # Compute attention loss if needed
+        att_loss = torch.tensor([0], device=model_device)
+        if params.att_rate != 0.0:
             mmodel = model.module if hasattr(model, "module") else model
-            # Note: We need to generate an unsorted version of token_ids
             unsorted_token_ids = graph_compiler.texts_to_ids(supervisions["text"])
             att_loss = mmodel.decoder_forward(
-                encoder_memory,
-                memory_mask,
-                token_ids=unsorted_token_ids,
-                sos_id=graph_compiler.sos_id,
-                eos_id=graph_compiler.eos_id,
+                encoder_memory, memory_mask, token_ids=unsorted_token_ids,
+                sos_id=graph_compiler.sos_id, eos_id=graph_compiler.eos_id,
             )
-        total_loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
-    else:
-        att_loss = torch.tensor([0])
-        total_loss = ctc_loss
-
-    # Add self-distillation loss with proper scale matching
-    if use_self_distillation and distillation_loss.item() > 0:
-        # With reduction='mean', CTC loss scale is more manageable
-        total_loss = total_loss + params.alpha * distillation_loss
-        logging.debug(f"Loss combination: ctc_loss={total_loss-params.alpha*distillation_loss:.4f}, "
-                     f"distill_loss={distillation_loss:.4f}, alpha={params.alpha}, "
-                     f"total_loss={total_loss:.4f}")
-
-    assert total_loss.requires_grad == is_training
-
-    # Metrics tracking
-    info = MetricsTracker()
+            ctc_att_loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
+        else:
+            ctc_att_loss = ctc_loss
+        
+        # Compute distillation loss if clean samples available
+        distillation_loss = torch.tensor(0.0, device=model_device)
+        if clean_feature is not None:
+            # Get output lengths
+            if isinstance(supervisions, dict) and 'num_frames' in supervisions:
+                original_lengths = supervisions['num_frames']
+                if not isinstance(original_lengths, torch.Tensor):
+                    original_lengths = torch.tensor(original_lengths, device=model_device)
+                output_lens = (original_lengths + params.subsampling_factor - 1) // params.subsampling_factor
+                output_lens = output_lens.cpu().tolist()
+            else:
+                batch_size = feature.size(0)
+                seq_len = feature.size(1) // params.subsampling_factor
+                output_lens = [seq_len] * batch_size
+            
+            # Get projected outputs for distillation
+            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+                teacher_model = ema_teacher.get_teacher_model()
+                with torch.no_grad():
+                    teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
+            else:
+                with torch.no_grad():
+                    teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
+            
+            student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
+            
+            if teacher_projected_outputs and student_projected_outputs:
+                from conformer import compute_multi_layer_distillation_loss
+                
+                # Parse distillation layers
+                try:
+                    distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
+                except:
+                    distill_layers = [int(params.distill_layers)]
+                
+                # Parse layer weights
+                layer_weights = None
+                if params.layer_weights is not None:
+                    try:
+                        layer_weights = [float(x.strip()) for x in params.layer_weights.split(',')]
+                        if len(layer_weights) != len(distill_layers):
+                            layer_weights = None
+                    except ValueError:
+                        layer_weights = None
+                
+                distillation_loss = compute_multi_layer_distillation_loss(
+                    teacher_knowledge=teacher_projected_outputs,
+                    student_knowledge=student_projected_outputs,
+                    knowledge_lens=output_lens,
+                    layer_indices=list(range(len(distill_layers))),
+                    loss_type=params.distill_loss_type,
+                    aggregation=params.distill_aggregation,
+                    temperature=params.distill_temperature,
+                    prototype_manager=prototype_manager,
+                    target_layers=distill_layers,
+                    layer_weights=layer_weights,
+                )
+    
+    # Combine losses
+    total_loss = ctc_att_loss + params.alpha * distillation_loss
+    
+    # Update metrics
     info["frames"] = supervision_segments[:, 2].sum().item()
     info["ctc_loss"] = ctc_loss.detach().cpu().item()
     info["att_loss"] = att_loss.detach().cpu().item()
     info["distill_loss"] = distillation_loss.detach().cpu().item()
     info["loss"] = total_loss.detach().cpu().item()
-
-    # `utt_duration` and `utt_pad_proportion` would be normalized by `utterances`
     info["utterances"] = feature.size(0)
-    # averaged input duration in frames over utterances
-    info["utt_duration"] = supervisions["num_frames"].sum().item()
-    # averaged padding proportion over utterances
+    info["utt_duration"] = supervisions["num_frames"].sum().item() if isinstance(supervisions, dict) and 'num_frames' in supervisions else feature.size(0) * feature.size(1)
     info["utt_pad_proportion"] = (
         ((feature.size(1) - supervisions["num_frames"]) / feature.size(1)).sum().item()
+        if isinstance(supervisions, dict) and 'num_frames' in supervisions
+        else 0.0
     )
+    
+    return total_loss, info
 
+
+def _compute_asr_only_loss(
+    params: AttributeDict,
+    model: nn.Module,
+    batch: dict,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
+    is_training: bool,
+    device,
+    model_device,
+    info: MetricsTracker,
+) -> Tuple[Tensor, MetricsTracker]:
+    """Compute only CTC + attention loss for ASR training (no distillation)."""
+    
+    feature = batch["inputs"].to(model_device)
+    supervisions = batch["supervisions"]
+    
+    assert feature.ndim == 3
+    
+    with torch.set_grad_enabled(is_training):
+        # Forward pass
+        nnet_output, encoder_memory, memory_mask, _, _ = model(feature, supervisions)
+        
+        # Compute CTC loss
+        ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
+        
+        # Compute attention loss if needed
+        att_loss = torch.tensor([0], device=model_device)
+        if params.att_rate != 0.0:
+            mmodel = model.module if hasattr(model, "module") else model
+            unsorted_token_ids = graph_compiler.texts_to_ids(supervisions["text"])
+            att_loss = mmodel.decoder_forward(
+                encoder_memory, memory_mask, token_ids=unsorted_token_ids,
+                sos_id=graph_compiler.sos_id, eos_id=graph_compiler.eos_id,
+            )
+            total_loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
+        else:
+            total_loss = ctc_loss
+    
+    # Update metrics
+    info["frames"] = supervision_segments[:, 2].sum().item()
+    info["ctc_loss"] = ctc_loss.detach().cpu().item()
+    info["att_loss"] = att_loss.detach().cpu().item()
+    info["distill_loss"] = 0.0  # No distillation in ASR mode
+    info["loss"] = total_loss.detach().cpu().item()
+    info["utterances"] = feature.size(0)
+    info["utt_duration"] = supervisions["num_frames"].sum().item() if isinstance(supervisions, dict) and 'num_frames' in supervisions else feature.size(0) * feature.size(1)
+    info["utt_pad_proportion"] = (
+        ((feature.size(1) - supervisions["num_frames"]) / feature.size(1)).sum().item()
+        if isinstance(supervisions, dict) and 'num_frames' in supervisions
+        else 0.0
+    )
+    
     return total_loss, info
 
 def compute_ctc_loss(
@@ -1002,6 +1161,7 @@ def compute_validation_loss(
                 batch=batch,
                 graph_compiler=graph_compiler,
                 is_training=False,
+                prototype_manager=None,  # Validation doesn't need prototype manager
             )
             
             assert loss.requires_grad is False
@@ -1204,6 +1364,7 @@ def train_one_epoch(
     rank: int = 0,
     ema_teacher: Optional[EMATeacher] = None,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    prototype_manager: Optional[PrototypeKMeansManager] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1237,7 +1398,7 @@ def train_one_epoch(
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in model.parameters())
         
-        logging.info(f"Epoch {params.cur_epoch} - Training mode: {params.proj_layer_training}")
+        logging.info(f"Epoch {params.cur_epoch} - Training mode: {params.learning_type}")
         logging.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
         
         # Check if projection layer is being trained
@@ -1258,6 +1419,7 @@ def train_one_epoch(
             graph_compiler=graph_compiler,
             is_training=True,
             ema_teacher=ema_teacher,
+            prototype_manager=prototype_manager,
         )
         # summary stats
         tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -1271,23 +1433,6 @@ def train_one_epoch(
         clip_grad_norm_(model.parameters(), 1.0, 2.0)  # Reduced from 5.0 to 1.0
         optimizer.step()
         
-        # Debug: Check parameter updates for "only-proj" mode
-        if params.proj_layer_training == "only-proj" and batch_idx % 1000 == 0 and rank == 0:
-            actual_model = model.module if hasattr(model, 'module') else model
-            if hasattr(actual_model, 'proj_layer') and actual_model.use_proj_layer:
-                # Check if projection layer parameters have gradients
-                proj_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 
-                                  for p in actual_model.proj_layer.parameters() if p.requires_grad)
-                
-                # Check other parameters don't have gradients (should be None or zero)
-                other_params_with_grad = 0
-                for name, param in actual_model.named_parameters():
-                    if 'proj_layer' not in name and param.requires_grad and param.grad is not None:
-                        if param.grad.abs().sum() > 0:
-                            other_params_with_grad += 1
-                
-                logging.info(f"Step {params.batch_idx_train}: proj_layer has grad: {proj_has_grad}, "
-                           f"other params with grad: {other_params_with_grad}")
         
         # Update EMA teacher model after optimizer step
         if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
@@ -1419,14 +1564,7 @@ def run(rank, world_size, args):
     logging.info("PROJECTION LAYER TRAINING CONFIGURATION")
     logging.info("=" * 60)
     logging.info(f"Use projection layer: {params.use_proj_layer}")
-    logging.info(f"Projection layer training mode: {params.proj_layer_training}")
     logging.info(f"Self-distillation enabled: {params.enable_self_distillation}")
-    if params.proj_layer_training == "only-proj":
-        logging.info("→ Only projection layer parameters will be updated")
-        logging.info("→ All other parameters will be frozen")
-    elif params.proj_layer_training == "full-finetuning":
-        logging.info("→ All model parameters will be updated")
-    logging.info("=" * 60)
     
     logging.info(params)
 
@@ -1487,7 +1625,8 @@ def run(rank, world_size, args):
     if isinstance(distill_layers, str):
         distill_layers = [int(x) for x in distill_layers.split(',') if x.strip()]
     
-    logging.info(f"Model creation parameters: distill_layers={distill_layers}, knowledge_type={params.knowledge}")
+    logging.info(f"Model creation parameters: distill_layers={distill_layers}")
+    logging.info(f"Memory optimization: creating model for learning_type={params.learning_type}")
 
     model = Conformer(
         num_features=params.feature_dim,
@@ -1498,63 +1637,102 @@ def run(rank, world_size, args):
         use_feat_batchnorm=params.use_feat_batchnorm,
         use_proj_layer=params.use_proj_layer,
         distill_layers=distill_layers,
+        proj_dim=128,  # Compressed dimension for prototype-based distillation
+        learning_type=params.learning_type,  # Memory optimization parameter
     )
     model.to(device)
-    
-    # Configure parameter training based on proj_layer_training setting
-    if params.proj_layer_training == "only-proj":
-        logging.info("Setting up projection layer only training - freezing all parameters except projection layer")
+
+    # Configure parameter training based on learning_type
+    if params.learning_type == "encoder-only":
+        logging.info("=" * 60)
+        logging.info("ENCODER-ONLY MODE: Configuring parameter freezing")
+        logging.info("=" * 60)
+        logging.info("Freezing all parameters except encoder and distillation projection layers")
         
-        # Freeze all parameters first
+        # First freeze all parameters
         for param in model.parameters():
             param.requires_grad = False
         
-        # Unfreeze only projection layer parameters
-        if hasattr(model, 'proj_layer') and model.use_proj_layer:
-            for param in model.proj_layer.parameters():
-                param.requires_grad = True
-            logging.info("Projection layer parameters unfrozen for training")
-        else:
-            logging.warning("Projection layer not found or disabled! No parameters will be trained.")
+        # Get the actual model (handle DDP wrapper)
+        actual_model = model.module if hasattr(model, 'module') else model
         
-        # Unfreeze distillation projection heads
-        if hasattr(model, 'distill_projection_heads') and model.distill_projection_heads:
-            for param in model.distill_projection_heads.parameters():
+        unfrozen_components = []
+        
+        # Unfreeze encoder parameters
+        if hasattr(actual_model, 'encoder'):
+            for param in actual_model.encoder.parameters():
                 param.requires_grad = True
-            logging.info(f"Distillation projection heads parameters unfrozen for training (layers: {distill_layers})")
+            unfrozen_components.append("encoder")
+        
+        # Unfreeze encoder embedding layers
+        if hasattr(actual_model, 'encoder_embed'):
+            for param in actual_model.encoder_embed.parameters():
+                param.requires_grad = True
+            unfrozen_components.append("encoder_embed")
+        
+        # Unfreeze encoder positional encoding
+        if hasattr(actual_model, 'encoder_pos'):
+            for param in actual_model.encoder_pos.parameters():
+                param.requires_grad = True
+            unfrozen_components.append("encoder_pos")
+        
+        # Unfreeze layer normalization layers (after_norm, etc.)
+        if hasattr(actual_model, 'after_norm'):
+            for param in actual_model.after_norm.parameters():
+                param.requires_grad = True
+            unfrozen_components.append("after_norm")
+        
+        # Unfreeze distillation-related projection layers based on use_proj_layer option
+        if params.use_proj_layer:
+            # Unfreeze main projection layer for distillation
+            if hasattr(actual_model, 'proj_layer'):
+                for param in actual_model.proj_layer.parameters():
+                    param.requires_grad = True
+                unfrozen_components.append("proj_layer")
             
-        # Count trainable parameters
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in model.parameters())
-        logging.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+            # Unfreeze distillation projection heads if they exist
+            if hasattr(actual_model, 'distill_projection_heads'):
+                for param in actual_model.distill_projection_heads.parameters():
+                    param.requires_grad = True
+                unfrozen_components.append("distill_projection_heads")
         
-    elif params.proj_layer_training == "full-finetuning":
-        logging.info("Setting up full fine-tuning - all parameters will be trained")
+        # CTC-related layers remain FROZEN (ctc_output, linear, etc.)
+        # These are only used for CTC loss computation, not for distillation
         
-        # Ensure all parameters are trainable (default behavior)
+        logging.info(f"use_proj_layer: {params.use_proj_layer}")
+        logging.info(f"Unfrozen components: {', '.join(unfrozen_components)}")
+        logging.info("Frozen components: CTC projection heads (ctc_output, linear, etc.)")
+        logging.info("=" * 60)
+            
+    else:
+        logging.info(f"Mode: {params.learning_type} - All parameters trainable")
+        # Ensure all parameters are trainable for other modes
         for param in model.parameters():
             param.requires_grad = True
-            
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logging.info(f"All parameters are trainable: {trainable_params:,}")
         
-    else:
-        raise ValueError(f"Unknown proj_layer_training mode: {params.proj_layer_training}")
+    # Count and log trainable parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params_count = total_params - trainable_params_count
     
+    logging.info(f"Parameter Summary:")
+    logging.info(f"  Total parameters: {total_params:,}")
+    logging.info(f"  Trainable parameters: {trainable_params_count:,}")
+    logging.info(f"  Frozen parameters: {frozen_params_count:,}")
+    logging.info(f"  Trainable ratio: {trainable_params_count/total_params:.2%}")
+        
     logging.info(f"Model created: distill_layers={model.distill_layers if hasattr(model, 'distill_layers') else 'NOT FOUND'}")
     if world_size > 1:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
-    # Get trainable parameters for optimizer (important for "only-proj" mode)
+    # Get trainable parameters for optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    if len(trainable_params) == 0:
-        raise ValueError("No trainable parameters found! Check proj_layer_training configuration.")
     
     logging.info(f"Optimizer will update {len(trainable_params)} parameter tensors")
         
     # Create optimizer and scheduler based on scheduler_type
     logging.info(f"Scheduler type: {params.scheduler_type}")
-    logging.info(f"Base LR: {getattr(params, 'base_lr', 'NOT SET')}")
+    logging.info(f"Base LR: {params.base_lr}")
     
     if params.scheduler_type == "noam":
         optimizer = Noam(
@@ -1568,7 +1746,7 @@ def run(rank, world_size, args):
         logging.info(f"Using Noam optimizer with lr_factor={params.lr_factor}")
     else:
         # Use Adam optimizer for plateau and constant schedulers
-        base_lr = getattr(params, 'base_lr', 2e-5)  # Default fallback
+        base_lr = params.base_lr  # Default fallback
         logging.info(f"Using Adam optimizer with base_lr={base_lr}")
         
         optimizer = torch.optim.Adam(
@@ -1605,12 +1783,37 @@ def run(rank, world_size, args):
         logging.info(f"Optimizer param group lr: {param_group['lr']}")
         break  # Just check first param group
 
-    librispeech = LibriSpeechAsrDataModule(args)
-
-    if params.full_libri:
-        train_cuts = librispeech.train_all_shuf_cuts()
+    # Determine dataset type based on learning_type and dataset_type argument
+    if params.dataset_type == "auto":
+        use_librilight = (params.learning_type == "encoder-only")
     else:
-        train_cuts = librispeech.train_clean_100_cuts()
+        use_librilight = (params.dataset_type == "librilight")
+    
+    # Create appropriate data module based on dataset type
+    if use_librilight:
+        logging.info("Using LibriLight dataset for prototype-based knowledge distillation")
+        data_module = LibriLightAsrDataModule(args)
+        # Use LibriLight training data for K-means clustering and training
+        train_cuts = data_module.librilight_train_cuts()
+        logging.info(f"Loaded LibriLight training cuts: {len(train_cuts)} utterances")
+    else:
+        logging.info("Using LibriSpeech dataset")
+        data_module = LibriSpeechAsrDataModule(args)
+        
+        # Load appropriate LibriSpeech training cuts based on configuration
+        if params.mini_libri:
+            logging.info("Using mini LibriSpeech (train-clean-5)")
+            train_cuts = data_module.train_clean_5_cuts()
+        elif params.full_libri:
+            logging.info("Using full LibriSpeech (960h)")
+            train_cuts = (
+                data_module.train_clean_100_cuts()
+                + data_module.train_clean_360_cuts()
+                + data_module.train_other_500_cuts()
+            )
+        else:
+            logging.info("Using LibriSpeech clean-100h subset")
+            train_cuts = data_module.train_clean_100_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
@@ -1626,13 +1829,24 @@ def run(rank, world_size, args):
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
     
     # For self-distillation: use shuffle=True with fixed seed for deterministic but diverse ordering
-    train_dl = librispeech.train_dataloaders(train_cuts, shuffle=True)
+    train_dl = data_module.train_dataloaders(train_cuts, shuffle=True)
 
-    # Use only dev_clean for faster validation (dev_other can be added later)
-    valid_cuts = librispeech.dev_clean_cuts()
-    # valid_cuts += librispeech.dev_other_cuts()  # Comment out for faster validation
-    valid_dl = librispeech.valid_dataloaders(valid_cuts)
+    # Create validation dataloader based on dataset type
+    if use_librilight:
+        # LibriLight uses LibriSpeech dev-clean for validation
+        valid_cuts = data_module.librilight_dev_cuts()
+        logging.info("Using LibriSpeech dev-clean for LibriLight validation")
+    else:
+        # Use LibriSpeech dev sets
+        if params.mini_libri:
+            valid_cuts = data_module.dev_clean_2_cuts()
+            logging.info("Using mini LibriSpeech dev-clean-2 for validation")
+        else:
+            valid_cuts = data_module.dev_clean_cuts()
+            # valid_cuts += data_module.dev_other_cuts()  # Comment out for faster validation
+            logging.info("Using LibriSpeech dev-clean for validation")
     
+    valid_dl = data_module.valid_dataloaders(valid_cuts)
     logging.info(f"Validation set size: {len(valid_cuts)} utterances")
     
     if params.sanity_check:
@@ -1646,36 +1860,22 @@ def run(rank, world_size, args):
     else: pass
     
     # Initialize EMA Teacher Model for self-distillation (must be before checkpoint loading)
+    # Memory optimization: Skip EMA teacher for ASR-only mode
     ema_teacher = None
-    if params.enable_self_distillation:
+    if params.enable_self_distillation and params.learning_type != "asr":
         logging.info(f"Initializing EMA teacher model with decay={params.ema_decay}, start_step={params.ema_start_step}")
         ema_teacher = EMATeacher(model, decay=params.ema_decay, device=device)    
+        logging.info(f"Memory optimization: EMA teacher created for {params.learning_type} mode")
+    elif params.learning_type == "asr":
+        logging.info(f"Memory optimization: Skipped EMA teacher for ASR-only mode")
+    else:
+        logging.info(f"EMA teacher disabled (enable_self_distillation={params.enable_self_distillation})")    
 
     checkpoints = load_checkpoint_if_available(
         params=params, 
         model=model, 
         ema_teacher=ema_teacher
     )
-    
-    # Re-apply parameter freezing after checkpoint loading (checkpoint might overwrite requires_grad)
-    if params.proj_layer_training == "only-proj":
-        logging.info("Re-applying projection layer only training after checkpoint loading")
-        
-        # Freeze all parameters first
-        for param in model.parameters():
-            param.requires_grad = False
-        
-        # Unfreeze only projection layer parameters
-        actual_model = model.module if hasattr(model, 'module') else model
-        if hasattr(actual_model, 'proj_layer') and actual_model.use_proj_layer:
-            for param in actual_model.proj_layer.parameters():
-                param.requires_grad = True
-            logging.info("Projection layer parameters re-unfrozen after checkpoint loading")
-        
-        # Verify parameter state after checkpoint loading
-        trainable_params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total_params_count = sum(p.numel() for p in model.parameters())
-        logging.info(f"After checkpoint loading - Trainable: {trainable_params_count:,} / {total_params_count:,}")
     
     # Load optimizer state from checkpoint if available
     if checkpoints and "optimizer" in checkpoints: 
@@ -1687,6 +1887,94 @@ def run(rank, world_size, args):
             logging.warning("Starting with fresh optimizer state")
             # Continue training with fresh optimizer state
     
+    # Initialize prototype manager for KL-based distillation
+    # Memory optimization: Skip prototype manager for ASR-only mode
+    prototype_manager = None
+    if params.learning_type in ["encoder-only", "hybrid"] and params.distill_loss_type == "kl":
+        try:
+            # Parse distillation layers
+            distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
+        except:
+            distill_layers = [int(params.distill_layers)]
+        
+        if distill_layers and rank == 0:  # Only initialize on rank 0
+            logging.info("Initializing prototype manager for KL-based distillation")
+            logging.info(f"Target layers for prototypes: {distill_layers}")
+            logging.info(f"Prototype directory: {params.prototype_dir}")
+            
+            prototype_manager = PrototypeKMeansManager(
+                target_layers=distill_layers,
+                num_prototypes=params.num_prototypes,
+                proj_dim=128,  # Use compressed dimension for prototype-based distillation
+                temperature=params.distill_temperature,
+                save_dir=params.prototype_dir
+            )
+            
+            # Check if prototype directory exists and has required prototype files
+            prototype_dir = Path(params.prototype_dir)
+            prototype_files_exist = all(
+                (prototype_dir / f"prototypes_layer_{layer_idx}.pt").exists() 
+                for layer_idx in distill_layers
+            )
+            
+            if not prototype_files_exist:
+                logging.info("Prototype files not found. Initializing prototypes using K-means clustering")
+                teacher_model = ema_teacher.get_teacher_model() if ema_teacher else model
+                prototype_manager.initialize_prototypes(
+                    teacher_model=teacher_model,
+                    dataloader=train_dl,
+                    num_samples_per_layer=params.prototype_samples,
+                    load_if_exists=False  # Force initialization since files don't exist
+                )
+                logging.info("Prototype initialization completed")
+            else:
+                logging.info("Prototype files found. Loading existing prototypes")
+                prototype_manager.load_prototypes(params.prototype_dir)
+                logging.info("Prototype loading completed")
+            
+            logging.info(f"Memory optimization: Prototype manager created for {params.learning_type} mode")
+    elif params.learning_type == "asr":
+        logging.info(f"Memory optimization: Skipped prototype manager for ASR-only mode")
+
+    # Log memory optimization summary after all components are initialized
+    actual_model = model.module if hasattr(model, 'module') else model
+    logging.info("=" * 60)
+    logging.info("MEMORY OPTIMIZATION SUMMARY")
+    logging.info("=" * 60)
+    logging.info(f"Learning type: {params.learning_type}")
+    
+    # Check which components are enabled/disabled
+    has_decoder = hasattr(actual_model, 'decoder') and actual_model.decoder is not None
+    has_proj_layer = hasattr(actual_model, 'proj_layer') and actual_model.proj_layer is not None
+    has_distill_heads = hasattr(actual_model, 'distill_projection_heads') and len(actual_model.distill_projection_heads) > 0
+    has_ctc_output = hasattr(actual_model, 'ctc_output') and actual_model.ctc_output is not None
+    
+    logging.info(f"  Decoder: {'Enabled' if has_decoder else 'Disabled (Memory Saved)'}")
+    logging.info(f"  Projection layer: {'Enabled' if has_proj_layer else 'Disabled (Memory Saved)'}")
+    logging.info(f"  Distillation heads: {'Enabled' if has_distill_heads else 'Disabled (Memory Saved)'}")
+    logging.info(f"  CTC output: {'Enabled' if has_ctc_output else 'Disabled (Memory Saved)'}")
+    logging.info(f"  EMA teacher: {'Enabled' if ema_teacher is not None else 'Disabled (Memory Saved)'}")
+    logging.info(f"  Prototype manager: {'Enabled' if prototype_manager is not None else 'Disabled (Memory Saved)'}")
+    
+    # Estimate memory savings
+    savings_info = []
+    if not has_decoder and params.learning_type == "encoder-only":
+        savings_info.append("Decoder layers")
+    if not has_proj_layer and params.learning_type == "asr":
+        savings_info.append("Projection layers")
+    if not has_distill_heads and params.learning_type == "asr":
+        savings_info.append("Distillation heads")
+    if ema_teacher is None and params.learning_type == "asr":
+        savings_info.append("EMA teacher model")
+    if prototype_manager is None and params.learning_type == "asr":
+        savings_info.append("Prototype manager")
+    
+    if savings_info:
+        logging.info(f"  Memory saved by disabling: {', '.join(savings_info)}")
+    else:
+        logging.info(f"  All components enabled for {params.learning_type} mode")
+    
+    logging.info("=" * 60)
 
     for epoch in range(params.start_epoch, params.num_epochs):
         fix_random_seed(params.seed + epoch)
@@ -1719,6 +2007,7 @@ def run(rank, world_size, args):
             rank=rank,
             ema_teacher=ema_teacher,
             scheduler=scheduler,
+            prototype_manager=prototype_manager,
         )
 
         save_checkpoint(
@@ -1758,6 +2047,7 @@ def scan_pessimistic_batches_for_oom(
                 batch=batch,
                 graph_compiler=graph_compiler,
                 is_training=True,
+                prototype_manager=None,  # Sanity check doesn't need prototype manager
             )
             loss.backward()
             clip_grad_norm_(model.parameters(), 5.0, 2.0)
@@ -2000,6 +2290,7 @@ def log_validation_examples_to_tensorboard(results_dict, tb_writer, step, max_ex
 def main():
     parser = get_parser()
     LibriSpeechAsrDataModule.add_arguments(parser)
+    LibriLightAsrDataModule.add_arguments(parser)  # Add LibriLight arguments
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
     args.lang_dir = Path(args.lang_dir)
