@@ -280,25 +280,6 @@ def get_parser():
              "'output_avg' computes loss for each layer and averages them.",
     )
     
-<<<<<<< HEAD
-    parser.add_argument(
-        "--clean-ratio",
-        type=float,
-        default=0.8,
-        help="Clean asr loss ratio for total ctc loss",
-    )
-    
-    parser.add_argument(
-        "--knowledge",
-        type=str,
-        default="encoder-output",
-        choices=["encoder-output", "attention-map"],
-        help="Type of knowledge to use for self-distillation: "
-             "'encoder-output' uses intermediate encoder layer outputs, "
-             "'attention-map' uses attention weights from self-attention layers.",
-    )
-=======
->>>>>>> master
     
     parser.add_argument(
         "--distill-temperature",
@@ -412,7 +393,7 @@ def get_parser():
     parser.add_argument(
         "--clean-ratio",
         type=float,
-        default=0.3,
+        default=0.1,
     )
     
     parser.add_argument(
@@ -868,15 +849,6 @@ def _compute_encoder_only_loss(
     
     return distillation_loss, info
 
-<<<<<<< HEAD
-    # NOTE: We need `encode_supervisions` to sort sequences with
-    # different duration in decreasing order, required by
-    # `k2.intersect_dense` called in `k2.ctc_loss`
-    s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
-    if t_output is not None:
-        t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
-        ctc_loss = params.clean_ratio * t_ctc_loss + (1.0-params.clean_ratio) * s_ctc_loss
-=======
 
 def _compute_hybrid_loss(
     params: AttributeDict,
@@ -900,7 +872,6 @@ def _compute_hybrid_loss(
         noisy_supervisions = batch['noisy']['supervisions']
         feature = noisy_feature
         supervisions = noisy_supervisions
->>>>>>> master
     else:
         feature = batch["inputs"].to(model_device)
         supervisions = batch["supervisions"]

@@ -7,22 +7,16 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 set -euo pipefail
 
 # Data Augmentation Controls (modify these as needed)
-enable_spec_aug=true          # SpecAugment (frequency/time masking)
-enable_musan=true             # MUSAN noise augmentation
+enable_spec_aug=false          # SpecAugment (frequency/time masking)
+enable_musan=false             # MUSAN noise augmentation
 enable_cutmix=false 
 enable_concatenate=false   
 
 # Training parameters
 world_size=1 
-<<<<<<< HEAD
 max_duration=300
 valid_max_duration=15         
 num_buckets=300               
-=======
-max_duration=400
-valid_max_duration=15         
-num_buckets=400               
->>>>>>> master
 num_workers=8    
 warm_step=10000
 lang_dir="./data/lang_bpe_1024"
@@ -54,21 +48,15 @@ validation_output_beam=5.0             # Output beam for validation (only used i
 validation_skip_wer=false              # Skip WER computation for even faster validation (디버깅용 - 이제 false로 변경)
 
 # Distillation Hyperparameters
-<<<<<<< HEAD
-enable_self_distillation=true
-distill_layers=
-=======
-enable_self_distillation=false
-distill_layers=3,5,14
->>>>>>> master
+enable_self_distillation=True
+distill_layers=6,12,18
 distill_loss_type="kl"         # mse, cosine, kl
 alpha=0
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 distill_temperature=4.0
 ema_decay=0.999
 ema_start_step=1000
-<<<<<<< HEAD
-exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_ft_normal-aug
+exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_only-rir_layer6,12,18
 
 #
 spec_aug_time_warp_factor=0              # default: 100
@@ -78,28 +66,15 @@ spec_aug_num_feature_masks=2              # default: 2
 spec_aug_frames_mask_size=100             # default: 100
 musan_ratio=0.5                           # default: 0.5
 snr_range=5,10
+enable_rir=True
+rir_prob=0.5
 
 #
-use_proj_layer=False
+use_proj_layer=True
 proj_layer_training="full-finetuning"       # full-finetuning, only-proj
-=======
-exp_dir=conformer_ctc_sd_proj/finetuning/pretrained_6,12,18_avg11
-
-#
-spec_aug_time_warp_factor=100              # default: 100
-spec_aug_num_frame_masks=3                # default: 2  
-spec_aug_features_mask_size=27            # default: 27
-spec_aug_num_feature_masks=3              # default: 2
-spec_aug_frames_mask_size=100             # default: 100
-musan_ratio=0.6                           # default: 0.5
-snr_range=5,10
-
-#
-use_proj_layer=false
->>>>>>> master
 return_cuts=False
 on_the_fly_feats=True
-learning_type="asr"
+learning_type="hybrid"
 
 if [ -z "${PYTHONPATH:-}" ]; then
     export PYTHONPATH="/tmp/icefall"
@@ -154,13 +129,9 @@ CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_proj/train.py \
     --use-proj-layer $use_proj_layer \
     --return-cuts $return_cuts \
     --on-the-fly-feats $on_the_fly_feats \
-<<<<<<< HEAD
     --bucketing-sampler false \
     --concatenate-cuts $enable_concatenate \
     --duration-factor 1.0 \
     --drop-last true \
     --shuffle true \
     
-=======
-    --learning-type $learning_type \
->>>>>>> master
