@@ -32,13 +32,13 @@ num_decoder_layers=0          # 0 for pure CTC
 start_epoch=0
 master_port=12346
 sanity_check=false           # Set to true for OOM checking (slower)
-resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/exp_kl_layer6,12,18/models/pretrained_libri-light_6,12,18_average3.pt
+resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/exp_kl_layer6,12,18_weakaug/models/pretrained_libri-light_6,12,18_weakaug_avg11.pt
 enable_validation=true       # Temporarily disable validation to avoid crashes
 valid_interval=5000           # Much larger interval if we enable validation later
 
 # Learning Rate Scheduler Settings (Fine-tuning options)
 scheduler_type="plateau"       # "noam", "plateau", "constant"
-base_lr=1e-4                 # Base learning rate for plateau/constant schedulers
+base_lr=5e-5                 # Base learning rate for plateau/constant schedulers
 scheduler_patience=3          # Patience for ReduceLROnPlateau
 scheduler_factor=0.5          # Factor for ReduceLROnPlateau (0.5 = 50% reduction)
 min_lr=5e-6          
@@ -59,16 +59,16 @@ knowledge="attention-map"      # "encoder-output", "attention-map"
 distill_temperature=4.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_proj/finetuning/pretrained_6,12,18_avg3
+exp_dir=conformer_ctc_sd_proj/finetuning/pretrained_kl_layer6,12,18_weakaug
 
 #
 spec_aug_time_warp_factor=100              # default: 100
-spec_aug_num_frame_masks=3                # default: 2  
+spec_aug_num_frame_masks=2                # default: 2  
 spec_aug_features_mask_size=27            # default: 27
-spec_aug_num_feature_masks=3              # default: 2
+spec_aug_num_feature_masks=2              # default: 2
 spec_aug_frames_mask_size=100             # default: 100
 musan_ratio=0.6                           # default: 0.5
-snr_range=5,10
+snr_range=10,20
 
 #
 use_proj_layer=false

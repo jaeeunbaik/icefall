@@ -59,11 +59,9 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
   
   # Count number of RIR files
   python -c "
-from lhotse import load_manifest
-cuts = load_manifest('$rir_cuts_manifest')
+from lhotse import CutSet
+cuts = CutSet.from_file('$rir_cuts_manifest')
 print(f'Successfully loaded {len(cuts)} RIR cuts')
-print(f'Total duration: {cuts.total_duration():.2f} seconds')
-print(f'Average duration: {cuts.total_duration()/len(cuts):.3f} seconds')
 "
   
   log "RIR data preparation completed successfully!"

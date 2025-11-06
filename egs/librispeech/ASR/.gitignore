@@ -7,3 +7,9 @@ e.dataset.sampling.cut_samplers import SimpleCutSampler
 *.sh
 events.out.*
 *.pkl
+*.lca
+*.jsonl.gz
+*.done
+*.model
+*.vocab
+*.scp

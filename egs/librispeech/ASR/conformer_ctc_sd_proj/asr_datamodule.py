@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, List
 
 import torch
-from lhotse import CutSet, Fbank, FbankConfig, load_manifest, load_manifest_lazy
+from lhotse import CutSet, Fbank, FbankConfig, load_manifest, load_manifest_lazy, RecordingSet
 from lhotse.dataset import (  # noqa F401 for PrecomputedFeatures
     CutConcatenate,
     CutMix,
@@ -39,6 +39,7 @@ from lhotse.dataset.input_strategies import (  # noqa F401 For AudioSamples
     AudioSamples,
     OnTheFlyFeatures,
 )
+from lhotse.dataset.cut_transforms.reverberate import ReverbWithImpulseResponse
 from lhotse.utils import fix_random_seed
 from torch.utils.data import DataLoader
 
@@ -407,6 +408,29 @@ class LibriSpeechAsrDataModule:
             default="10,20",
             help="SNR range of MUSAN noise augmentation. "
         )
+        
+        group.add_argument(
+            "--enable-rir",
+            type=str2bool,
+            default=False,
+            help="When enabled, apply RIR (Room Impulse Response) reverberation augmentation to training data.",
+        )
+        
+        group.add_argument(
+            "--rir-prob",
+            type=float,
+            default=0.5,
+            help="Probability of applying RIR reverberation augmentation. "
+            "Used only when --enable-rir is True.",
+        )
+        
+        group.add_argument(
+            "--rir-early-only",
+            type=str2bool,
+            default=False,
+            help="If True, use only the first 50ms of the RIR impulse response for reverberation. "
+            "Used only when --enable-rir is True.",
+        )
 
         group.add_argument(
             "--input-strategy",
@@ -456,6 +480,36 @@ class LibriSpeechAsrDataModule:
         # Setup augmentation transforms (for noisy dataset)
         transforms = []
         min_snr, max_snr = list(map(int, self.args.snr_range.split(',')))
+        
+        # Add RIR reverberation if enabled
+        if self.args.enable_rir:
+            logging.info("Enable RIR reverberation")
+            logging.info("Loading RIR impulse responses...")
+            
+            # Load RIR recordings from prepared manifest
+            rir_manifest_path = Path("data/fbank/rir_recordings.jsonl.gz")
+            if rir_manifest_path.exists():
+                rir_recordings = load_manifest(rir_manifest_path)
+                logging.info(f"Loaded {len(rir_recordings)} RIR impulse responses")
+                
+                transforms.append(
+                    ReverbWithImpulseResponse(
+                        rir_recordings=rir_recordings,
+                        p=self.args.rir_prob,
+                        normalize_output=True,
+                        preserve_id=True,
+                        early_only=self.args.rir_early_only,
+                        rir_channels=[0],  # Use first channel
+                    )
+                )
+                logging.info(f"RIR config: prob={self.args.rir_prob}, early_only={self.args.rir_early_only}")
+            else:
+                logging.warning(f"RIR manifest not found at {rir_manifest_path}")
+                logging.warning("Please run: bash prepare_rir_data.sh to generate RIR data")
+                logging.warning("Continuing without RIR augmentation")
+        else:
+            logging.info("Disable RIR reverberation")
+        
         if self.args.enable_musan:
             logging.info("Enable MUSAN")
             logging.info("About to get Musan cuts")

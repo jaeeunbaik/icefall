@@ -14,7 +14,7 @@ set -eou pipefail
 nj=30
 # run step 0 to step 5 by default
 stage=1  # 1
-stop_stage=7  # 6
+stop_stage=3  # 6
 
 # Note: This script just prepare the minimal requirements that needed by a
 # transducer training with bpe units.

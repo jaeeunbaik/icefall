@@ -13,10 +13,10 @@ enable_cutmix=true
 enable_concatenate=false   
 
 # Strong SpecAugment Configuration (default values in comments)
-spec_aug_time_warp_factor=80              # default: 100
+spec_aug_time_warp_factor=0               # DISABLED: 0 means no time warping
 spec_aug_num_frame_masks=4                # default: 2  
 spec_aug_features_mask_size=40            # default: 27
-spec_aug_num_feature_masks=3              # default: 2
+spec_aug_num_feature_masks=3              # default: 2p
 spec_aug_frames_mask_size=150             # default: 100
 
 # MUSAN Configuration
