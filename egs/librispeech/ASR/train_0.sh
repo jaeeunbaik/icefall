@@ -30,17 +30,13 @@ num_decoder_layers=0          # 0 for pure CTC
 start_epoch=8
 master_port=12346
 sanity_check=false           # Set to true for OOM checking (slower)
-<<<<<<< HEAD
 resume_from=/home/nas4/user/jaeeun/icefall/egs/librispeech/ASR/zoo/conformer_ctc_70000_from77avg10.pt
-=======
-resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/exp_kl_layer6,12,18/models/pretrained_libri-light_6,12,18_average11.pt
->>>>>>> master
 enable_validation=true       # Temporarily disable validation to avoid crashes
 valid_interval=500000           # Much larger interval if we enable validation later
 
 # Learning Rate Scheduler Settings (Fine-tuning options)
 scheduler_type="plateau"       # "noam", "plateau", "constant"
-base_lr=1e-4                 # Base learning rate for plateau/constant schedulers
+base_lr=5e-5                 # Base learning rate for plateau/constant schedulers
 scheduler_patience=3          # Patience for ReduceLROnPlateau
 scheduler_factor=0.5          # Factor for ReduceLROnPlateau (0.5 = 50% reduction)
 min_lr=5e-6            
@@ -52,39 +48,15 @@ validation_output_beam=5.0             # Output beam for validation (only used i
 validation_skip_wer=false              # Skip WER computation for even faster validation (디버깅용 - 이제 false로 변경)
 
 # Distillation Hyperparameters
-<<<<<<< HEAD
 enable_self_distillation=true
-distill_layers=5,11,17
+distill_layers=6,12,18
 distill_loss_type="kl"         # mse, cosine, kl
-alpha=500000000000
-=======
-enable_self_distillation=false
-distill_layers=3,5,14
-distill_loss_type="kl"         # mse, cosine, kl
-alpha=0
->>>>>>> master
+alpha=1000
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 distill_temperature=4.0
 ema_decay=0.999
 ema_start_step=1000
-<<<<<<< HEAD
-clean_ratio=0.1
-exp_dir=conformer_ctc_sd_proj/train70000-epoch77-avg10/exp_kl_layer5,11,17_strong-aug
-
-#
-spec_aug_time_warp_factor=0              # default: 100
-spec_aug_num_frame_masks=4                # default: 2  
-spec_aug_features_mask_size=27            # default: 27
-spec_aug_num_feature_masks=4              # default: 2
-spec_aug_frames_mask_size=100             # default: 100
-musan_ratio=0.8                           # default: 0.5
-snr_range=0,5
-
-#
-use_proj_layer=True
-proj_layer_training="full-finetuning"       # full-finetuning, only-proj
-=======
-exp_dir=conformer_ctc_sd_proj/finetuning/pretrained_6,12,18_avg11
+exp_dir=conformer_ctc_sd_proj/hybrid/exp_layer6,12,18_rir0.6_weakspec
 
 #
 spec_aug_time_warp_factor=100              # default: 100
@@ -94,13 +66,16 @@ spec_aug_num_feature_masks=3              # default: 2
 spec_aug_frames_mask_size=100             # default: 100
 musan_ratio=0.6                           # default: 0.5
 snr_range=5,10
+enable_rir=True
+rir_prob=0.5
 
 #
-use_proj_layer=false
->>>>>>> master
+use_proj_layer=true
 return_cuts=False
 on_the_fly_feats=True
-learning_type="asr"
+learning_type="hybrid"
+
+
 
 if [ -z "${PYTHONPATH:-}" ]; then
     export PYTHONPATH="/tmp/icefall"
@@ -156,12 +131,9 @@ CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_proj/train.py \
     --use-proj-layer $use_proj_layer \
     --return-cuts $return_cuts \
     --on-the-fly-feats $on_the_fly_feats \
-<<<<<<< HEAD
     --bucketing-sampler false \
     --duration-factor 1.0 \
     --drop-last true \
     --shuffle true \
-    
-=======
-    --learning-type $learning_type \
->>>>>>> master
+    --enable-rir $enable_rir \
+    --rir-prob $rir_prob \

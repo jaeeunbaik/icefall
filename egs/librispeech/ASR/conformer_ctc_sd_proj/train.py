@@ -318,13 +318,6 @@ def get_parser():
     )
     
     parser.add_argument(
-        "--clean-ratio",
-        type=float,
-        default=0.8,
-        help="The ratio of clean asr loss for total ctc loss, weighted sum of clean loss and noisy loss",
-    )
-    
-    parser.add_argument(
         "--method",
         type=str,
         default="ctc-decoding",
@@ -400,7 +393,7 @@ def get_parser():
     parser.add_argument(
         "--clean-ratio",
         type=float,
-        default=0.3,
+        default=0.1,
     )
     
     parser.add_argument(
