@@ -49,7 +49,7 @@ class PrototypeKMeansManager:
         num_prototypes: int = 256,
         proj_dim: int = 256,
         temperature: float = 2.0,
-        use_pca: bool = True,
+        use_pca: bool = True,  # Re-enabled for memory-efficient prototypes with projection layer
         pca_dim: int = 128,
         device: torch.device = None,
         save_dir: str = "./prototypes"
@@ -120,19 +120,19 @@ class PrototypeKMeansManager:
                     # Self-distillation format with clean/noisy
                     feature = batch['clean']['inputs'].to(self.device)
                     supervisions = batch['clean']['supervisions']
-                    if batch_idx % 10 == 0:
+                    if batch_idx % 100 == 0:  # Reduced logging frequency
                         logging.info(f"DEBUG batch_{batch_idx}: Using clean/noisy format")
                 elif 'inputs' in batch:
                     # Standard format
                     feature = batch['inputs'].to(self.device)
                     supervisions = batch['supervisions']
-                    if batch_idx % 10 == 0:
+                    if batch_idx % 100 == 0:  # Reduced logging frequency
                         logging.info(f"DEBUG batch_{batch_idx}: Using standard format")
                 elif 'feature' in batch:
                     # Legacy format
                     feature = batch['feature'].to(self.device)
                     feature_lens = batch['feature_lens'].to(self.device)
-                    if batch_idx % 10 == 0:
+                    if batch_idx % 100 == 0:  # Reduced logging frequency
                         logging.info(f"DEBUG batch_{batch_idx}: Using legacy format")
                 else:
                     logging.warning(f"Unknown batch format. Keys: {list(batch.keys())}")
@@ -150,14 +150,11 @@ class PrototypeKMeansManager:
                 ):
                     # Safe to reuse per-utterance lengths
                     if isinstance(supervisions['num_frames'], torch.Tensor):
-                        logging.info("supervision['num_frames'] is already torch tensor")
+                        # Removed frequent logging: supervision['num_frames'] is already torch tensor
                         feature_lens = supervisions['num_frames'].to(self.device)
                     else:
-                        logging.info("supervision['num_frames'] is not torch tensor")
                         feature_lens = torch.tensor(supervisions['num_frames'], device=self.device)
                     
-                    if batch_idx % 10 == 0:
-                        logging.info(f"DEBUG batch_{batch_idx}: Reusing supervision num_frames, len={len(supervisions['num_frames'])}")
                 else:
                     # Fallback: use actual feature sequence length for each example
                     feature_lens = torch.full((feature.size(0),), feature.size(1), device=self.device)
@@ -177,7 +174,7 @@ class PrototypeKMeansManager:
                 if len(outputs) >= 4 and outputs[3] is not None:
                     # Use layer_results if available
                     layer_results = outputs[3]
-                    layer_output = layer_results[layer_idx]
+                    layer_output = layer_results[layer_idx-1]
                                             
                 # If model returned a tuple/list (some forwards return multiple
                 # values), try to pick the first tensor-like object.

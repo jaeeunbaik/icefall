@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import List
 
-from lhotse import CutSet, Recording, SupervisionSegment
+from lhotse import CutSet, Recording, SupervisionSegment, MonoCut
 from lhotse.audio import AudioSource
 from lhotse.utils import Pathlike
 
@@ -76,22 +76,16 @@ def prepare_rir_manifest(
                 logging.warning(f"RIR file not found: {rir_path}")
                 continue
             
-            # Create recording
-            recording = Recording(
-                id=rir_id,
-                sources=[
-                    AudioSource(
-                        type="file",
-                        channels=[0],
-                        source=str(rir_path.resolve()),
-                    )
-                ],
-                sampling_rate=16000,  # Assume 16kHz, will be auto-detected by lhotse
-                num_samples=None,     # Will be auto-detected
-                duration=None,        # Will be auto-detected
-            )
-            
-            recordings.append(recording)
+            try:
+                # Create recording from file (auto-detects duration, sampling_rate, etc.)
+                recording = Recording.from_file(
+                    path=rir_path,
+                    recording_id=rir_id,
+                )
+                recordings.append(recording)
+            except Exception as e:
+                logging.warning(f"Failed to create recording from {rir_path}: {e}")
+                continue
     
     logging.info(f"Found {len(recordings)} RIR files")
     
@@ -99,9 +93,8 @@ def prepare_rir_manifest(
     from lhotse import RecordingSet
     recording_set = RecordingSet.from_recordings(recordings)
     
-    # Validate recordings (this will auto-detect duration, sampling_rate, etc.)
+    # Validate recordings
     logging.info("Validating RIR recordings...")
-    recording_set = recording_set.with_path_prefix("")  # Ensure absolute paths
     
     # Save recording manifest
     output_path = output_dir / "rir_recordings.jsonl.gz"
@@ -110,7 +103,11 @@ def prepare_rir_manifest(
     
     # Create a simple cuts manifest for RIR (whole files)
     logging.info("Creating RIR cuts manifest...")
-    rir_cuts = CutSet.from_manifests(recordings=recording_set)
+    # Use CutSet.from_manifests to properly link recordings and cuts
+    rir_cuts = CutSet.from_manifests(
+        recordings=recording_set,
+        supervisions=None,  # No supervisions for RIR files
+    )
     cuts_output_path = output_dir / "rir_cuts.jsonl.gz"
     rir_cuts.to_file(cuts_output_path)
     logging.info(f"Saved RIR cuts manifest to {cuts_output_path}")

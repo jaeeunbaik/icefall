@@ -154,7 +154,7 @@ def get_parser():
     parser.add_argument(
         "--att-rate",
         type=float,
-        default=0.8,
+        default=0.0,
         help="""The attention rate.
         The total loss is (1 -  att_rate) * ctc_loss + att_rate * att_loss
         """,
@@ -708,7 +708,7 @@ def compute_loss(
     prototype_manager: Optional[PrototypeKMeansManager] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
-    Compute CTC loss with optional self-distillation.
+    Compute loss optimized by learning-type to avoid unnecessary computations.
 
     Args:
       params:
@@ -724,220 +724,331 @@ def compute_loss(
         True for training. False for validation.
     """
     device = graph_compiler.device
-    
-    # Handle clean-noisy batch structure for self-distillation
-    if 'clean' in batch and 'noisy' in batch and params.learning_type in ["encoder-only", "hybrid"]:
-        # Self-distillation mode with clean-noisy samples
-        clean_feature = batch['clean']['inputs']
-        noisy_feature = batch['noisy']['inputs']
-        clean_supervisions = batch['clean']['supervisions']
-        noisy_supervisions = batch['noisy']['supervisions']
-        
-        # Use noisy samples as primary for CTC loss computation
-        feature = noisy_feature
-        supervisions = noisy_supervisions
-        # Clean-noisy pairs are being used for self-distillation
-        
-    elif params.learning_type == "asr":
-        # Normal mode or self-distillation disabled
-        feature = batch["inputs"]
-        supervisions = batch["supervisions"]
-        # Note: We'll move to the correct device later after getting model device
-        
-        clean_feature = None
-        noisy_feature = None
-        clean_supervisions = None
-    
-    # at entry, feature is (N, T, C)
-    assert feature.ndim == 3
-    
-    # Ensure model and feature are on the same device
     model_device = next(model.parameters()).device
     
-    # Move feature to the correct device if needed
-    if feature.device != model_device:
-        feature = feature.to(model_device)
+    # Initialize metrics for tracking
+    info = MetricsTracker()
     
-    # Also move clean_feature if it exists
-    if clean_feature is not None and clean_feature.device != model_device:
-        clean_feature = clean_feature.to(model_device)
-    t_output = None
+    # Early branch based on learning_type to optimize computation
+    if params.learning_type == "encoder-only":
+        return _compute_encoder_only_loss(
+            params, model, batch, graph_compiler, is_training, 
+            ema_teacher, prototype_manager, device, model_device, info
+        )
+    elif params.learning_type == "hybrid":
+        return _compute_hybrid_loss(
+            params, model, batch, graph_compiler, is_training,
+            ema_teacher, prototype_manager, device, model_device, info
+        )
+    elif params.learning_type == "asr":
+        return _compute_asr_only_loss(
+            params, model, batch, graph_compiler, is_training,
+            device, model_device, info
+        )
+    else:
+        raise ValueError(f"Unknown learning_type: {params.learning_type}")
+
+
+def _compute_encoder_only_loss(
+    params: AttributeDict,
+    model: nn.Module,
+    batch: dict,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
+    is_training: bool,
+    ema_teacher: Optional[EMATeacher],
+    prototype_manager: Optional[PrototypeKMeansManager],
+    device,
+    model_device,
+    info: MetricsTracker,
+) -> Tuple[Tensor, MetricsTracker]:
+    """Compute only distillation loss for encoder-only training."""
+    
+    # Handle clean-noisy batch structure
+    if 'clean' not in batch or 'noisy' not in batch:
+        raise ValueError("encoder-only mode requires clean-noisy batch structure")
+    
+    clean_feature = batch['clean']['inputs'].to(model_device)
+    noisy_feature = batch['noisy']['inputs'].to(model_device)
+    clean_supervisions = batch['clean']['supervisions']
+    noisy_supervisions = batch['noisy']['supervisions']
+    
+    assert clean_feature.ndim == 3 and noisy_feature.ndim == 3
+    
     with torch.set_grad_enabled(is_training):
-        # Forward pass through model (noisy sample)
-        nnet_output, encoder_memory, memory_mask, hiddens, att_maps = model(feature, supervisions)
+        # Student forward pass (noisy sample)
+        _, _, _, _, _ = model(noisy_feature, noisy_supervisions)
         
-        # Get the original lengths from supervisions
-        if isinstance(supervisions, dict) and 'num_frames' in supervisions:
-            original_lengths = supervisions['num_frames']
+        # Get output lengths for distillation
+        if isinstance(noisy_supervisions, dict) and 'num_frames' in noisy_supervisions:
+            original_lengths = noisy_supervisions['num_frames']
             if not isinstance(original_lengths, torch.Tensor):
                 original_lengths = torch.tensor(original_lengths, device=model_device)
-            # Apply subsampling factor to get actual output lengths
             output_lens = (original_lengths + params.subsampling_factor - 1) // params.subsampling_factor
-            output_lens = output_lens.cpu().tolist()  # Convert to list for distillation functions
+            output_lens = output_lens.cpu().tolist()
         else:
-            # Fallback: use actual nnet_output sequence lengths for each sample
-            batch_size = nnet_output.size(1)  # N from (T, N, C)
-            seq_len = nnet_output.size(0)     # T from (T, N, C) 
+            batch_size = clean_feature.size(0)
+            seq_len = clean_feature.size(1) // params.subsampling_factor
             output_lens = [seq_len] * batch_size
         
-        # Self-distillation computation
-        distillation_loss = torch.tensor(0.0, device=model_device)
+        # Teacher forward pass
+        if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+            teacher_model = ema_teacher.get_teacher_model()
+            with torch.no_grad():
+                teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
+        else:
+            with torch.no_grad():
+                teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
         
+        # Student projected outputs
+        student_projected_outputs = model.get_intermediate_outputs(noisy_feature, noisy_supervisions)
         
-        if params.learning_type in ["encoder-only", "hybrid"] and clean_feature is not None:
-            # Log only occasionally to reduce spam
-            if params.batch_idx_train % 1000 == 0:
-                logging.info(f"Self-distillation active: ema_teacher={ema_teacher is not None}, step={params.batch_idx_train}")
+        # Compute distillation loss
+        if teacher_projected_outputs and student_projected_outputs:
+            from conformer import compute_multi_layer_distillation_loss
             
-            # Use EMA teacher model if available, otherwise use the same model with clean samples
-            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-                teacher_model = ema_teacher.get_teacher_model()
-                with torch.no_grad():
-                    t_output, _, _, t_hidden, t_maps = teacher_model(clean_feature, clean_supervisions)
-                if params.batch_idx_train % 1000 == 0:
-                    logging.info(f"Using EMA teacher model for distillation (step {params.batch_idx_train})")
-            else:
-                # 학습 초반부에 EMA 모델 없으면 student 모델로 계산
-                with torch.no_grad():
-                    t_output, _, _, t_hidden, t_maps = model(clean_feature, clean_supervisions)
-                if ema_teacher is not None and params.batch_idx_train % 1000 == 0:
-                    logging.info(f"EMA teacher exists but step {params.batch_idx_train} < start_step {params.ema_start_step}, using same model")
-                elif ema_teacher is None and params.batch_idx_train % 1000 == 0:
-                    logging.info(f"No EMA teacher, using same model with clean samples as teacher")
-            
-            # Parse distillation layers from comma-separated string
+            # Parse distillation layers
             try:
                 distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
             except:
                 distill_layers = [int(params.distill_layers)]
-                
-            # Extract encoder outputs for distillation with projection layers
-            if params.use_proj_layer and len(distill_layers) > 0:
-                # Use get_intermediate_outputs for projection-applied distillation layers
-                if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-                    teacher_model = ema_teacher.get_teacher_model()
-                    with torch.no_grad():
-                        teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
-                else:
-                    with torch.no_grad():
-                        teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
-                
-                # Get student projected outputs
-                student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
-                
-                if teacher_projected_outputs and student_projected_outputs:
-                    from conformer import compute_multi_layer_distillation_loss
-                    
-                    # Parse layer weights from string if provided
+            
+            # Parse layer weights
+            layer_weights = None
+            if params.layer_weights is not None:
+                try:
+                    layer_weights = [float(x.strip()) for x in params.layer_weights.split(',')]
+                    if len(layer_weights) != len(distill_layers):
+                        layer_weights = None
+                except ValueError:
                     layer_weights = None
-                    if params.layer_weights is not None:
-                        try:
-                            layer_weights = [float(x.strip()) for x in params.layer_weights.split(',')]
-                            if len(layer_weights) != len(distill_layers):
-                                logging.warning(f"layer_weights length ({len(layer_weights)}) doesn't match distill_layers length ({len(distill_layers)}). Using equal weights.")
-                                layer_weights = None
-                        except ValueError as e:
-                            logging.warning(f"Failed to parse layer_weights '{params.layer_weights}': {e}. Using equal weights.")
-                            layer_weights = None
-                    
-                    distillation_loss = compute_multi_layer_distillation_loss(
-                        teacher_knowledge=teacher_projected_outputs,
-                        student_knowledge=student_projected_outputs,
-                        knowledge_lens=output_lens,
-                        layer_indices=list(range(len(distill_layers))),  # Use sequential indices since we already filtered layers
-                        loss_type=params.distill_loss_type,
-                        aggregation=params.distill_aggregation,
-                        temperature=params.distill_temperature,
-                        prototype_manager=prototype_manager,
-                        target_layers=distill_layers,  # Pass actual layer indices for prototype lookup
-                        layer_weights=layer_weights,  # Add layer weights parameter
-                    )
-                else:
-                    logging.warning("Failed to get projected outputs for distillation")
-                    distillation_loss = torch.tensor(0.0, device=model_device)
-                
-
+            
+            distillation_loss = compute_multi_layer_distillation_loss(
+                teacher_knowledge=teacher_projected_outputs,
+                student_knowledge=student_projected_outputs,
+                knowledge_lens=output_lens,
+                layer_indices=list(range(len(distill_layers))),
+                loss_type=params.distill_loss_type,
+                aggregation=params.distill_aggregation,
+                temperature=params.distill_temperature,
+                prototype_manager=prototype_manager,
+                target_layers=distill_layers,
+                layer_weights=layer_weights,
+            )
         else:
-            if params.learning_type == "asr":
-                logging.debug("Self-distillation disabled (learning-type=asr)")
-            elif clean_feature is None:
-                logging.warning("Clean feature is None, skipping self-distillation")
+            distillation_loss = torch.tensor(0.0, device=model_device, requires_grad=is_training)
+    
+    # Update metrics
+    info["frames"] = clean_feature.size(0) * clean_feature.size(1)  # Approximate
+    info["ctc_loss"] = 0.0  # Not computed in encoder-only mode
+    info["att_loss"] = 0.0  # Not computed in encoder-only mode
+    info["distill_loss"] = distillation_loss.detach().cpu().item()
+    info["loss"] = distillation_loss.detach().cpu().item()
+    info["utterances"] = clean_feature.size(0)
+    info["utt_duration"] = noisy_supervisions["num_frames"].sum().item() if isinstance(noisy_supervisions, dict) and 'num_frames' in noisy_supervisions else clean_feature.size(0) * clean_feature.size(1)
+    info["utt_pad_proportion"] = 0.0  # Approximate
+    
+    return distillation_loss, info
 
-    # NOTE: We need `encode_supervisions` to sort sequences with
-    # different duration in decreasing order, required by
-    # `k2.intersect_dense` called in `k2.ctc_loss`
-    s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
-    if t_output is not None:
-        t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
-        ctc_loss = params.clean_ratio * t_ctc_loss + (1 - params.clean_ratio) * s_ctc_loss
-        
-        # Log CTC loss analysis every 100 steps
-        if params.batch_idx_train % 100 == 0:
-            logging.info(f"CTC Loss analysis - Step {params.batch_idx_train}: "
-                        f"teacher_ctc={t_ctc_loss.item():.4f}, "
-                        f"student_ctc={s_ctc_loss.item():.4f}, "
-                        f"clean_ratio={params.clean_ratio}, "
-                        f"weighted_ctc={ctc_loss.item():.4f}")
+
+def _compute_hybrid_loss(
+    params: AttributeDict,
+    model: nn.Module,
+    batch: dict,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
+    is_training: bool,
+    ema_teacher: Optional[EMATeacher],
+    prototype_manager: Optional[PrototypeKMeansManager],
+    device,
+    model_device,
+    info: MetricsTracker,
+) -> Tuple[Tensor, MetricsTracker]:
+    """Compute CTC + distillation loss for hybrid training."""
+    
+    # Handle batch structure
+    if 'clean' in batch and 'noisy' in batch:
+        clean_feature = batch['clean']['inputs'].to(model_device)
+        noisy_feature = batch['noisy']['inputs'].to(model_device)
+        clean_supervisions = batch['clean']['supervisions']
+        noisy_supervisions = batch['noisy']['supervisions']
+        feature = noisy_feature
+        supervisions = noisy_supervisions
     else:
-        ctc_loss = s_ctc_loss
-
-    # Attention loss computation (if applicable)
-    if params.att_rate != 0.0:
-        with torch.set_grad_enabled(is_training):
+        feature = batch["inputs"].to(model_device)
+        supervisions = batch["supervisions"]
+        clean_feature = None
+        noisy_feature = None
+        clean_supervisions = None
+    
+    assert feature.ndim == 3
+    
+    with torch.set_grad_enabled(is_training):
+        # Forward pass
+        nnet_output, encoder_memory, memory_mask, _, _ = model(feature, supervisions)
+        
+        # Compute CTC loss
+        s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
+        
+        # Compute teacher CTC loss if clean samples available
+        t_output = None
+        if clean_feature is not None:
+            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+                teacher_model = ema_teacher.get_teacher_model()
+                with torch.no_grad():
+                    t_output, _, _, _, _ = teacher_model(clean_feature, clean_supervisions)
+            else:
+                with torch.no_grad():
+                    t_output, _, _, _, _ = model(clean_feature, clean_supervisions)
+                    
+            if t_output is not None:
+                t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
+                ctc_loss = params.clean_ratio * t_ctc_loss + (1 - params.clean_ratio) * s_ctc_loss
+            else:
+                ctc_loss = s_ctc_loss
+        else:
+            ctc_loss = s_ctc_loss
+        
+        # Compute attention loss if needed
+        att_loss = torch.tensor([0], device=model_device)
+        if params.att_rate != 0.0:
             mmodel = model.module if hasattr(model, "module") else model
-            # Note: We need to generate an unsorted version of token_ids
             unsorted_token_ids = graph_compiler.texts_to_ids(supervisions["text"])
             att_loss = mmodel.decoder_forward(
-                encoder_memory,
-                memory_mask,
-                token_ids=unsorted_token_ids,
-                sos_id=graph_compiler.sos_id,
-                eos_id=graph_compiler.eos_id,
+                encoder_memory, memory_mask, token_ids=unsorted_token_ids,
+                sos_id=graph_compiler.sos_id, eos_id=graph_compiler.eos_id,
             )
-        total_loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
-    else:
-        att_loss = torch.tensor([0])
-        total_loss = ctc_loss
-
-    # Add self-distillation loss with proper scale matching
-    if params.learning_type == "encoder-only":
-        total_loss = distillation_loss
-        logging.debug(f"encoder only training: "
-                      f"distill_loss={distillation_loss.item():.4f}")
+            ctc_att_loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
+        else:
+            ctc_att_loss = ctc_loss
         
-    elif params.learning_type == "hybrid" and distillation_loss.item() > 0:
-        # With reduction='mean', CTC loss scale is more manageable
-        total_loss = total_loss + params.alpha * distillation_loss
-        logging.debug(f"Loss combination: ctc_loss={(total_loss-params.alpha*distillation_loss).item():.4f}, "
-                     f"distill_loss={distillation_loss.item():.4f}, alpha={params.alpha}, "
-                     f"total_loss={total_loss.item():.4f}")
+        # Compute distillation loss if clean samples available
+        distillation_loss = torch.tensor(0.0, device=model_device)
+        if clean_feature is not None:
+            # Get output lengths
+            if isinstance(supervisions, dict) and 'num_frames' in supervisions:
+                original_lengths = supervisions['num_frames']
+                if not isinstance(original_lengths, torch.Tensor):
+                    original_lengths = torch.tensor(original_lengths, device=model_device)
+                output_lens = (original_lengths + params.subsampling_factor - 1) // params.subsampling_factor
+                output_lens = output_lens.cpu().tolist()
+            else:
+                batch_size = feature.size(0)
+                seq_len = feature.size(1) // params.subsampling_factor
+                output_lens = [seq_len] * batch_size
+            
+            # Get projected outputs for distillation
+            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+                teacher_model = ema_teacher.get_teacher_model()
+                with torch.no_grad():
+                    teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
+            else:
+                with torch.no_grad():
+                    teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
+            
+            student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
+            
+            if teacher_projected_outputs and student_projected_outputs:
+                from conformer import compute_multi_layer_distillation_loss
+                
+                # Parse distillation layers
+                try:
+                    distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
+                except:
+                    distill_layers = [int(params.distill_layers)]
+                
+                # Parse layer weights
+                layer_weights = None
+                if params.layer_weights is not None:
+                    try:
+                        layer_weights = [float(x.strip()) for x in params.layer_weights.split(',')]
+                        if len(layer_weights) != len(distill_layers):
+                            layer_weights = None
+                    except ValueError:
+                        layer_weights = None
+                
+                distillation_loss = compute_multi_layer_distillation_loss(
+                    teacher_knowledge=teacher_projected_outputs,
+                    student_knowledge=student_projected_outputs,
+                    knowledge_lens=output_lens,
+                    layer_indices=list(range(len(distill_layers))),
+                    loss_type=params.distill_loss_type,
+                    aggregation=params.distill_aggregation,
+                    temperature=params.distill_temperature,
+                    prototype_manager=prototype_manager,
+                    target_layers=distill_layers,
+                    layer_weights=layer_weights,
+                )
     
-    elif params.learning_type == "asr":
-        # For ASR mode, use only CTC + attention losses (no distillation)
-        # total_loss is already set above to ctc_loss or (ctc_loss + att_loss)
-        logging.debug(f"ASR training - Loss combination: ctc_loss={ctc_loss.item():.4f}, "
-                    f"att_loss={att_loss.item():.4f}, att_rate={params.att_rate}, "
-                    f"total_loss={total_loss.item():.4f}")
-
-    assert total_loss.requires_grad == is_training
-
-    # Metrics tracking
-    info = MetricsTracker()
+    # Combine losses
+    total_loss = ctc_att_loss + params.alpha * distillation_loss
+    
+    # Update metrics
     info["frames"] = supervision_segments[:, 2].sum().item()
     info["ctc_loss"] = ctc_loss.detach().cpu().item()
     info["att_loss"] = att_loss.detach().cpu().item()
     info["distill_loss"] = distillation_loss.detach().cpu().item()
     info["loss"] = total_loss.detach().cpu().item()
-
-    # `utt_duration` and `utt_pad_proportion` would be normalized by `utterances`
     info["utterances"] = feature.size(0)
-    # averaged input duration in frames over utterances
-    info["utt_duration"] = supervisions["num_frames"].sum().item()
-    # averaged padding proportion over utterances
+    info["utt_duration"] = supervisions["num_frames"].sum().item() if isinstance(supervisions, dict) and 'num_frames' in supervisions else feature.size(0) * feature.size(1)
     info["utt_pad_proportion"] = (
         ((feature.size(1) - supervisions["num_frames"]) / feature.size(1)).sum().item()
+        if isinstance(supervisions, dict) and 'num_frames' in supervisions
+        else 0.0
     )
+    
+    return total_loss, info
 
+
+def _compute_asr_only_loss(
+    params: AttributeDict,
+    model: nn.Module,
+    batch: dict,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
+    is_training: bool,
+    device,
+    model_device,
+    info: MetricsTracker,
+) -> Tuple[Tensor, MetricsTracker]:
+    """Compute only CTC + attention loss for ASR training (no distillation)."""
+    
+    feature = batch["inputs"].to(model_device)
+    supervisions = batch["supervisions"]
+    
+    assert feature.ndim == 3
+    
+    with torch.set_grad_enabled(is_training):
+        # Forward pass
+        nnet_output, encoder_memory, memory_mask, _, _ = model(feature, supervisions)
+        
+        # Compute CTC loss
+        ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
+        
+        # Compute attention loss if needed
+        att_loss = torch.tensor([0], device=model_device)
+        if params.att_rate != 0.0:
+            mmodel = model.module if hasattr(model, "module") else model
+            unsorted_token_ids = graph_compiler.texts_to_ids(supervisions["text"])
+            att_loss = mmodel.decoder_forward(
+                encoder_memory, memory_mask, token_ids=unsorted_token_ids,
+                sos_id=graph_compiler.sos_id, eos_id=graph_compiler.eos_id,
+            )
+            total_loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
+        else:
+            total_loss = ctc_loss
+    
+    # Update metrics
+    info["frames"] = supervision_segments[:, 2].sum().item()
+    info["ctc_loss"] = ctc_loss.detach().cpu().item()
+    info["att_loss"] = att_loss.detach().cpu().item()
+    info["distill_loss"] = 0.0  # No distillation in ASR mode
+    info["loss"] = total_loss.detach().cpu().item()
+    info["utterances"] = feature.size(0)
+    info["utt_duration"] = supervisions["num_frames"].sum().item() if isinstance(supervisions, dict) and 'num_frames' in supervisions else feature.size(0) * feature.size(1)
+    info["utt_pad_proportion"] = (
+        ((feature.size(1) - supervisions["num_frames"]) / feature.size(1)).sum().item()
+        if isinstance(supervisions, dict) and 'num_frames' in supervisions
+        else 0.0
+    )
+    
     return total_loss, info
 
 def compute_ctc_loss(
@@ -1486,6 +1597,7 @@ def run(rank, world_size, args):
         distill_layers = [int(x) for x in distill_layers.split(',') if x.strip()]
     
     logging.info(f"Model creation parameters: distill_layers={distill_layers}")
+    logging.info(f"Memory optimization: creating model for learning_type={params.learning_type}")
 
     model = Conformer(
         num_features=params.feature_dim,
@@ -1496,6 +1608,8 @@ def run(rank, world_size, args):
         use_feat_batchnorm=params.use_feat_batchnorm,
         use_proj_layer=params.use_proj_layer,
         distill_layers=distill_layers,
+        proj_dim=128,  # Compressed dimension for prototype-based distillation
+        learning_type=params.learning_type,  # Memory optimization parameter
     )
     model.to(device)
 
@@ -1717,10 +1831,16 @@ def run(rank, world_size, args):
     else: pass
     
     # Initialize EMA Teacher Model for self-distillation (must be before checkpoint loading)
+    # Memory optimization: Skip EMA teacher for ASR-only mode
     ema_teacher = None
-    if params.enable_self_distillation:
+    if params.enable_self_distillation and params.learning_type != "asr":
         logging.info(f"Initializing EMA teacher model with decay={params.ema_decay}, start_step={params.ema_start_step}")
         ema_teacher = EMATeacher(model, decay=params.ema_decay, device=device)    
+        logging.info(f"Memory optimization: EMA teacher created for {params.learning_type} mode")
+    elif params.learning_type == "asr":
+        logging.info(f"Memory optimization: Skipped EMA teacher for ASR-only mode")
+    else:
+        logging.info(f"EMA teacher disabled (enable_self_distillation={params.enable_self_distillation})")    
 
     checkpoints = load_checkpoint_if_available(
         params=params, 
@@ -1739,6 +1859,7 @@ def run(rank, world_size, args):
             # Continue training with fresh optimizer state
     
     # Initialize prototype manager for KL-based distillation
+    # Memory optimization: Skip prototype manager for ASR-only mode
     prototype_manager = None
     if params.learning_type in ["encoder-only", "hybrid"] and params.distill_loss_type == "kl":
         try:
@@ -1755,7 +1876,7 @@ def run(rank, world_size, args):
             prototype_manager = PrototypeKMeansManager(
                 target_layers=distill_layers,
                 num_prototypes=params.num_prototypes,
-                proj_dim=params.attention_dim,  # Use model's attention_dim
+                proj_dim=128,  # Use compressed dimension for prototype-based distillation
                 temperature=params.distill_temperature,
                 save_dir=params.prototype_dir
             )
@@ -1781,6 +1902,50 @@ def run(rank, world_size, args):
                 logging.info("Prototype files found. Loading existing prototypes")
                 prototype_manager.load_prototypes(params.prototype_dir)
                 logging.info("Prototype loading completed")
+            
+            logging.info(f"Memory optimization: Prototype manager created for {params.learning_type} mode")
+    elif params.learning_type == "asr":
+        logging.info(f"Memory optimization: Skipped prototype manager for ASR-only mode")
+
+    # Log memory optimization summary after all components are initialized
+    actual_model = model.module if hasattr(model, 'module') else model
+    logging.info("=" * 60)
+    logging.info("MEMORY OPTIMIZATION SUMMARY")
+    logging.info("=" * 60)
+    logging.info(f"Learning type: {params.learning_type}")
+    
+    # Check which components are enabled/disabled
+    has_decoder = hasattr(actual_model, 'decoder') and actual_model.decoder is not None
+    has_proj_layer = hasattr(actual_model, 'proj_layer') and actual_model.proj_layer is not None
+    has_distill_heads = hasattr(actual_model, 'distill_projection_heads') and len(actual_model.distill_projection_heads) > 0
+    has_ctc_output = hasattr(actual_model, 'ctc_output') and actual_model.ctc_output is not None
+    
+    logging.info(f"  Decoder: {'Enabled' if has_decoder else 'Disabled (Memory Saved)'}")
+    logging.info(f"  Projection layer: {'Enabled' if has_proj_layer else 'Disabled (Memory Saved)'}")
+    logging.info(f"  Distillation heads: {'Enabled' if has_distill_heads else 'Disabled (Memory Saved)'}")
+    logging.info(f"  CTC output: {'Enabled' if has_ctc_output else 'Disabled (Memory Saved)'}")
+    logging.info(f"  EMA teacher: {'Enabled' if ema_teacher is not None else 'Disabled (Memory Saved)'}")
+    logging.info(f"  Prototype manager: {'Enabled' if prototype_manager is not None else 'Disabled (Memory Saved)'}")
+    
+    # Estimate memory savings
+    savings_info = []
+    if not has_decoder and params.learning_type == "encoder-only":
+        savings_info.append("Decoder layers")
+    if not has_proj_layer and params.learning_type == "asr":
+        savings_info.append("Projection layers")
+    if not has_distill_heads and params.learning_type == "asr":
+        savings_info.append("Distillation heads")
+    if ema_teacher is None and params.learning_type == "asr":
+        savings_info.append("EMA teacher model")
+    if prototype_manager is None and params.learning_type == "asr":
+        savings_info.append("Prototype manager")
+    
+    if savings_info:
+        logging.info(f"  Memory saved by disabling: {', '.join(savings_info)}")
+    else:
+        logging.info(f"  All components enabled for {params.learning_type} mode")
+    
+    logging.info("=" * 60)
 
     for epoch in range(params.start_epoch, params.num_epochs):
         fix_random_seed(params.seed + epoch)

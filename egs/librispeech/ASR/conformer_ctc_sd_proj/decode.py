@@ -652,19 +652,196 @@ def decode_dataset(
                             logging.info(f"  REF: {ref_text}")
                             logging.info(f"  HYP: {hyp_text}")
                             
+                            # Text normalization function
+                            def normalize_text(words):
+                                """Normalize word sequences for more accurate WER calculation.
+                                Strategy: Convert all compound words to their separated form and handle spelling variants.
+                                """
+                                normalized = []
+                                
+                                # Normalization rules: compound word -> separated words
+                                compound_to_separated = {
+                                    'CANDLELIGHT': ['CANDLE', 'LIGHT'],
+                                    'NIGHTTIME': ['NIGHT', 'TIME'],
+                                    'DAYTIME': ['DAY', 'TIME'],
+                                    'MOONLIGHT': ['MOON', 'LIGHT'],
+                                    'SUNLIGHT': ['SUN', 'LIGHT'],
+                                    'FIREPLACE': ['FIRE', 'PLACE'],
+                                    'DOORWAY': ['DOOR', 'WAY'],
+                                    'RAINFALL': ['RAIN', 'FALL'],
+                                    'WATERFALL': ['WATER', 'FALL'],
+                                    'SUNSHINE': ['SUN', 'SHINE'],
+                                    'BEDROOM': ['BED', 'ROOM'],
+                                    'BATHROOM': ['BATH', 'ROOM'],
+                                    'CLASSROOM': ['CLASS', 'ROOM'],
+                                    'OUTSIDE': ['OUT', 'SIDE'],
+                                    'INSIDE': ['IN', 'SIDE'],
+                                    'SOMEBODY': ['SOME', 'BODY'],
+                                    'EVERYBODY': ['EVERY', 'BODY'],
+                                    'ANYBODY': ['ANY', 'BODY'],
+                                    'NOBODY': ['NO', 'BODY'],
+                                    'SOMETHING': ['SOME', 'THING'],
+                                    'EVERYTHING': ['EVERY', 'THING'],
+                                    'ANYTHING': ['ANY', 'THING'],
+                                    'NOTHING': ['NO', 'THING'],
+                                    'SOMEWHERE': ['SOME', 'WHERE'],
+                                    'EVERYWHERE': ['EVERY', 'WHERE'],
+                                    'ANYWHERE': ['ANY', 'WHERE'],
+                                    'NOWHERE': ['NO', 'WHERE'],
+                                    # Contractions
+                                    "DON'T": ['DO', 'NOT'],
+                                    "WON'T": ['WILL', 'NOT'],
+                                    "CAN'T": ['CAN', 'NOT'],
+                                    "ISN'T": ['IS', 'NOT'],
+                                    "AREN'T": ['ARE', 'NOT'],
+                                    "WASN'T": ['WAS', 'NOT'],
+                                    "WEREN'T": ['WERE', 'NOT'],
+                                    "HAVEN'T": ['HAVE', 'NOT'],
+                                    "HASN'T": ['HAS', 'NOT'],
+                                    "HADN'T": ['HAD', 'NOT'],
+                                    "DOESN'T": ['DOES', 'NOT'],
+                                    "DIDN'T": ['DID', 'NOT'],
+                                    "SHOULDN'T": ['SHOULD', 'NOT'],
+                                    "WOULDN'T": ['WOULD', 'NOT'],
+                                    "COULDN'T": ['COULD', 'NOT'],
+                                    "MUSTN'T": ['MUST', 'NOT'],
+                                }
+                                
+                                # Spelling variants normalization (American vs British, etc.)
+                                spelling_variants = {
+                                    'THEATRE': 'THEATER',
+                                    'THEATER': 'THEATER',  # Keep consistent
+                                    'COLOUR': 'COLOR',
+                                    'COLOR': 'COLOR',
+                                    'HONOUR': 'HONOR',
+                                    'HONOR': 'HONOR',
+                                    'FAVOUR': 'FAVOR',
+                                    'FAVOR': 'FAVOR',
+                                    'CENTRE': 'CENTER',
+                                    'CENTER': 'CENTER',
+                                    'METRE': 'METER',
+                                    'METER': 'METER',
+                                    'LITRE': 'LITER',
+                                    'LITER': 'LITER',
+                                    'DEFENCE': 'DEFENSE',
+                                    'DEFENSE': 'DEFENSE',
+                                    'LICENCE': 'LICENSE',
+                                    'LICENSE': 'LICENSE',
+                                    'PRACTISE': 'PRACTICE',
+                                    'PRACTICE': 'PRACTICE',
+                                    'TRAVELLING': 'TRAVELING',
+                                    'TRAVELING': 'TRAVELING',
+                                    'REALISE': 'REALIZE',
+                                    'REALIZE': 'REALIZE',
+                                    'ORGANISED': 'ORGANIZED',
+                                    'ORGANIZED': 'ORGANIZED',
+                                }
+                                
+                                # Process each word individually
+                                for word in words:
+                                    word_upper = word.upper()
+                                    
+                                    # First check for spelling variants
+                                    if word_upper in spelling_variants:
+                                        word_upper = spelling_variants[word_upper]
+                                    
+                                    # Then check for compound words
+                                    if word_upper in compound_to_separated:
+                                        # Split compound word
+                                        normalized.extend(compound_to_separated[word_upper])
+                                    else:
+                                        # Keep word as is
+                                        normalized.append(word_upper)
+                                
+                                return normalized
+                            
                             # Simple accuracy check
                             ref_words = ref_text.split()
                             hyp_words = hyps[i]
-                            if ref_words == hyp_words:
-                                logging.info(f"  --> ✅ PERFECT MATCH ({len(ref_words)} words)")
+                            
+                            # Apply normalization to both reference and hypothesis
+                            norm_ref_words = normalize_text(ref_words)
+                            norm_hyp_words = normalize_text(hyp_words)
+                            
+                            if norm_ref_words == norm_hyp_words:
+                                if ref_words == hyp_words:
+                                    logging.info(f"  --> ✅ PERFECT MATCH ({len(ref_words)} words)")
+                                else:
+                                    logging.info(f"  --> ✅ NORMALIZED MATCH ({len(ref_words)} words)")
+                                    logging.info(f"      Original WER would be non-zero, but normalized WER is 0%")
                             else:
-                                # Calculate simple word error rate for this utterance
-                                import difflib
-                                matcher = difflib.SequenceMatcher(None, ref_words, hyp_words)
-                                word_errors = len(ref_words) + len(hyp_words) - 2 * sum(triple.size for triple in matcher.get_matching_blocks())
-                                utt_wer = (word_errors / len(ref_words) * 100) if len(ref_words) > 0 else 0
-                                logging.info(f"  --> ❌ WER: {utt_wer:.1f}% (REF: {len(ref_words)} words, HYP: {len(hyp_words)} words)")
-                        logging.info("=" * 50)
+                                # Calculate proper word error rate using edit distance
+                                def edit_distance_debug(ref, hyp):
+                                    """Calculate edit distance with detailed debugging."""
+                                    m, n = len(ref), len(hyp)
+                                    
+                                    # Create DP table
+                                    dp = [[0] * (n + 1) for _ in range(m + 1)]
+                                    
+                                    # Initialize base cases
+                                    for i in range(m + 1):
+                                        dp[i][0] = i  # i deletions to get empty string
+                                    for j in range(n + 1):
+                                        dp[0][j] = j  # j insertions to get target string
+                                    
+                                    # Fill DP table
+                                    for i in range(1, m + 1):
+                                        for j in range(1, n + 1):
+                                            if ref[i-1] == hyp[j-1]:
+                                                dp[i][j] = dp[i-1][j-1]  # No operation needed
+                                            else:
+                                                dp[i][j] = 1 + min(
+                                                    dp[i-1][j],    # Deletion from ref
+                                                    dp[i][j-1],    # Insertion to ref
+                                                    dp[i-1][j-1]   # Substitution
+                                                )
+                                    
+                                    return dp[m][n]
+                                
+                                # Alternative implementation using Python's difflib for verification
+                                def edit_distance_simple(ref, hyp):
+                                    """Simple edit distance calculation for verification."""
+                                    import difflib
+                                    
+                                    # Use difflib's SequenceMatcher to get operations
+                                    matcher = difflib.SequenceMatcher(None, ref, hyp)
+                                    operations = matcher.get_opcodes()
+                                    
+                                    edit_count = 0
+                                    for op, i1, i2, j1, j2 in operations:
+                                        if op == 'replace':
+                                            edit_count += max(i2-i1, j2-j1)
+                                        elif op == 'delete':
+                                            edit_count += i2-i1
+                                        elif op == 'insert':
+                                            edit_count += j2-j1
+                                        # 'equal' operations don't count
+                                    
+                                    return edit_count
+                                
+                                # Test example with known result first - use actual case
+                                test_ref = ["THEY", "SAY", "ILLUMINATION", "BY", "CANDLE", "LIGHT", "IS", "THE", "PRETTIEST", "IN", "THE", "WORLD"]
+                                test_hyp_perfect = ["THEY", "SAY", "ILLUMINATION", "BY", "CANDLELIGHT", "IS", "THE", "PRETTIEST", "IN", "THE", "WORLD"]  # Perfect normalization case
+                                test_hyp_actual = hyp_words[:len(test_ref)]  # Use actual HYP words for comparison
+                                
+                                # Test perfect normalization case
+                                test_orig_edit_dist = edit_distance_debug(test_ref, test_hyp_perfect)
+                                test_norm_ref = normalize_text(test_ref)
+                                test_norm_hyp_perfect = normalize_text(test_hyp_perfect)
+                                test_norm_edit_dist = edit_distance_debug(test_norm_ref, test_norm_hyp_perfect)
+                                
+                                # Calculate both original and normalized WER
+                                orig_edit_dist = edit_distance_debug(ref_words, hyp_words)
+                                norm_edit_dist = edit_distance_debug(norm_ref_words, norm_hyp_words)
+                                
+                                # Also calculate with simple method for comparison
+                                orig_edit_simple = edit_distance_simple(ref_words, hyp_words)
+                                
+                                orig_wer = (orig_edit_dist / len(ref_words) * 100) if len(ref_words) > 0 else 0
+                                norm_wer = (norm_edit_dist / len(norm_ref_words) * 100) if len(norm_ref_words) > 0 else 0
+                                
+                                logging.info(f"  --> ❌ WER: {orig_wer:.1f}% (DP Edit Distance: {orig_edit_dist}, Simple: {orig_edit_simple})")
+                                
         else:
             assert len(results) > 0, "It should not decode to empty in the first batch!"
             this_batch = []

@@ -29,7 +29,7 @@ att_rate=0                    # 0 for pure CTC, >0 for CTC+Attention
 num_decoder_layers=0          # 0 for pure CTC
 
 # Other settings
-start_epoch=0
+start_epoch=8
 master_port=12346
 sanity_check=false           # Set to true for OOM checking (slower)
 resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/exp_kl_layer6,12,18/models/pretrained_libri-light_6,12,18_average11.pt

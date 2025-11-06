@@ -36,7 +36,7 @@ class HubertDataset(torch.utils.data.Dataset):
     .. code-block::
 
         {
-            'audio': (B x NumSamples) float tensor
+            'audio': (B x NumSamples) float tensor OR (B x T x F) fbank features
         }
     """
 
@@ -63,6 +63,34 @@ class HubertDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, cuts: CutSet) -> Dict[str, Any]:
         self._validate(cuts)
+        
+        # Check if cuts have pre-computed features
+        if all(cut.has_features for cut in cuts):
+            # Use pre-computed fbank features
+            features = []
+            feature_lens = []
+            for cut in cuts:
+                feat = cut.load_features()  # [T, F] where F is num_mel_bins (80)
+                features.append(torch.from_numpy(feat))
+                feature_lens.append(feat.shape[0])
+            
+            # Collate features
+            max_len = max(feature_lens)
+            num_features = features[0].shape[1]  # 80 for fbank
+            collated_features = torch.zeros(len(features), max_len, num_features)
+            padding_mask = torch.ones(len(features), max_len, dtype=torch.bool)
+            
+            for i, (feat, feat_len) in enumerate(zip(features, feature_lens)):
+                collated_features[i, :feat_len] = feat
+                padding_mask[i, :feat_len] = False
+            
+            return {
+                "cuts": cuts,
+                "audio": collated_features,  # [B, T, F]
+                "padding_mask": padding_mask,
+            }
+        
+        # Fallback: load raw audio and process
         audio, _ = read_audio_from_cuts(cuts)
         for i, item in enumerate(audio):
             audio[i] = self.postprocess(item, self.sample_rate)
@@ -77,18 +105,11 @@ class HubertDataset(torch.utils.data.Dataset):
             audio, audio_lens, audio_size
         )
 
-        kmeans = [cut.custom["kmeans"] for cut in cuts]
-        kmeans = [
-            torch.tensor([int(item) for item in label.split()], dtype=torch.int64)
-            for label in kmeans
-        ]
-        kmeans, _ = self.collater_frm_label(kmeans, audio_size, audio_starts)
 
         return {
             "cuts": cuts,
             "audio": audio,
             "padding_mask": padding_mask,
-            "kmeans": kmeans,
         }
 
     def postprocess(self, wav, cur_sample_rate):

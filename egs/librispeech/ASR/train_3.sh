@@ -7,75 +7,76 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 
 set -euo pipefail
 
-# Data Augmentation Controls (modify these as needed)
-enable_spec_aug=true          # SpecAugment (frequency/time masking)
-enable_musan=true             # MUSAN noise augmentation
-enable_cutmix=false 
-enable_cutmix=false 
-enable_concatenate=false   
-
-# Training parameters
 world_size=1 
-max_duration=400
-valid_max_duration=15         
-num_buckets=400               
-num_workers=8    
-warm_step=10000
-lang_dir="./data/lang_bpe_1024"
-method="ctc-decoding"
-
-# Model parameters
-att_rate=0                    # 0 for pure CTC, >0 for CTC+Attention
-num_decoder_layers=0          # 0 for pure CTC
-
-# Other settings
-start_epoch=0
 master_port=12346
+num_epochs=10
+start_epoch=0
+exp_dir=conformer_ctc_sd_proj/self-distillation/kl_6,12,18_alpha0.5_no-musan
+lang_dir="./data/lang_bpe_1024"
 sanity_check=false           # Set to true for OOM checking (slower)
-resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/exp_kl_layer6,12,18_weakaug/models/pretrained_libri-light_6,12,18_weakaug_avg3.pt
-valid_interval=5000           # Much larger interval if we enable validation later
+
 
 # Learning Rate Scheduler Settings (Fine-tuning options)
 scheduler_type="plateau"       # "noam", "plateau", "constant"
-base_lr=1e-4                 # Base learning rate for plateau/constant schedulers
+base_lr=3e-5                 # Base learning rate for plateau/constant schedulers
 scheduler_patience=3          # Patience for ReduceLROnPlateau
 scheduler_factor=0.5          # Factor for ReduceLROnPlateau (0.5 = 50% reduction)
 min_lr=5e-6          
 
-# Validation decoding settings
-enable_validation=True
-validation_decoding_method="greedy"    # "greedy" or "beam" - use greedy for faster validation
-validation_search_beam=10.0            # Beam size for validation (only used if method="beam")
-validation_output_beam=5.0             # Output beam for validation (only used if method="beam")
-validation_skip_wer=false              # Skip WER computation for even faster validation (디버깅용 - 이제 false로 변경)
 
 # Distillation Hyperparameters
-enable_self_distillation=false
-distill_layers=3,5,14
+enable_self_distillation=true
+distill_layers=6,12,18
 distill_loss_type="kl"         # mse, cosine, kl
-alpha=0
+alpha=1000.0
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
-knowledge="attention-map"      # "encoder-output", "attention-map"
 distill_temperature=4.0
+layer_weights=2.0,3.0,4.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_proj/finetuning/pretrained_layer6,12,18_weakaug_avg3
+
+# Training Schema
+learning_type="hybrid"
+use_proj_layer=true
+
+
+# Data Augmentation Controls (modify these as needed)
+enable_spec_aug=true          # SpecAugment (frequency/time masking)
+enable_musan=false             # MUSAN noise augmentation
+enable_cutmix=false 
+enable_concatenate=false   
+
+# Training parameters
+
+max_duration=220
+valid_max_duration=15         
+num_buckets=220               
+num_workers=8    
+warm_step=10000
+method="ctc-decoding"
+
+
+# Other settings
+resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/zoo/conformer_ctc_70000_from77avg10.pt
+valid_interval=5000           # Much larger interval if we enable validation later
 
 #
 spec_aug_time_warp_factor=100              # default: 100
-spec_aug_num_frame_masks=3                # default: 2  
+spec_aug_num_frame_masks=6                # default: 2  
 spec_aug_features_mask_size=27            # default: 27
-spec_aug_num_feature_masks=3              # default: 2
+spec_aug_num_feature_masks=6              # default: 2
 spec_aug_frames_mask_size=100             # default: 100
-musan_ratio=0.6                           # default: 0.5
+musan_ratio=0.9                           # default: 0.5
 snr_range=5,10
 
 #
-use_proj_layer=false
-proj_layer_training="full-finetuning"       # full-finetuning, only-proj
 return_cuts=False
 on_the_fly_feats=True
-learning_type="asr"
+# Prototype 최적화 설정 추가
+prototype_dir="./prototypes/librispeech_clean_256"  # 명확한 경로
+num_prototypes=256              # 적절한 크기
+prototype_samples=50000         # 샘플 수 줄여서 빠른 초기화
+
 
 if [ -z "${PYTHONPATH:-}" ]; then
     export PYTHONPATH="/tmp/icefall"
@@ -91,8 +92,6 @@ CUDA_VISIBLE_DEVICES=3 python3 ./conformer_ctc_sd_proj/train.py \
     --warm-step $warm_step \
     --start-epoch $start_epoch \
     --resume-from $resume_from \
-    --att-rate $att_rate \
-    --num-decoder-layers $num_decoder_layers \
     --num-workers $num_workers \
     --enable-spec-aug $enable_spec_aug \
     --enable-musan $enable_musan \
@@ -111,12 +110,6 @@ CUDA_VISIBLE_DEVICES=3 python3 ./conformer_ctc_sd_proj/train.py \
     --scheduler-patience $scheduler_patience \
     --scheduler-factor $scheduler_factor \
     --min-lr $min_lr \
-    --enable-validation $enable_validation \
-    --valid-interval $valid_interval \
-    --validation-decoding-method $validation_decoding_method \
-    --validation-search-beam $validation_search_beam \
-    --validation-output-beam $validation_output_beam \
-    --validation-skip-wer $validation_skip_wer \
     --enable-self-distillation $enable_self_distillation \
     --distill-layers $distill_layers \
     --distill-loss-type $distill_loss_type \
@@ -129,3 +122,6 @@ CUDA_VISIBLE_DEVICES=3 python3 ./conformer_ctc_sd_proj/train.py \
     --return-cuts $return_cuts \
     --on-the-fly-feats $on_the_fly_feats \
     --learning-type $learning_type \
+    --prototype-dir $prototype_dir \
+    --num-prototypes $num_prototypes \
+    --prototype-samples $prototype_samples
