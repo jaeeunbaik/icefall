@@ -1,0 +1,5 @@
+events.out*
+*.pkl
+launch.json
+*.code-workspace
+
