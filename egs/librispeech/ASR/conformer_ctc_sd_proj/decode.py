@@ -86,6 +86,70 @@ def load_averaged_model(
     return model
 
 
+def load_averaged_model_step(
+    model_dir: str,
+    model: torch.nn.Module,
+    step: int,
+    avg: int,
+    device: torch.device,
+    strict: bool,
+):
+    """
+    Load a model which is the average of checkpoints at 2000-step intervals
+
+    :param model_dir: a str of the experiment directory
+    :param model: a torch.nn.Module instance
+    :param step: the maximum step to load from
+    :param avg: how many models to average (from the most recent ones)
+    :param device: move model to this device
+    :param strict: whether to strictly enforce state_dict matching
+
+    :return: A model averaged
+    """
+    from pathlib import Path
+    
+    # Generate steps every 2000 up to max step
+    steps = list(range(2000, step + 1, 2000))
+    
+    # Keep only the last 'avg' steps
+    if avg > 0 and avg < len(steps):
+        steps = steps[-avg:]
+    
+    # Find checkpoint files for each step
+    model_dir_path = Path(model_dir)
+    filenames = []
+    for s in steps:
+        # Try different naming patterns
+        patterns = [
+            f"step-{s}.pt",
+            f"step-{s}-*.pt",
+            f"epoch-*-step-{s}.pt",
+        ]
+        
+        found = False
+        for pattern in patterns:
+            matches = sorted(model_dir_path.glob(pattern))
+            if matches:
+                filenames.append(str(matches[-1]))
+                found = True
+                break
+        
+        if not found:
+            logging.warning(f"Checkpoint not found for step {s} in {model_dir}")
+    
+    if not filenames:
+        raise ValueError(f"No checkpoints found for steps up to {step}")
+    
+    logging.info(f"Averaging {len(filenames)} checkpoints at 2000-step intervals:")
+    for f in filenames:
+        logging.info(f"  - {f}")
+    
+    model.to(device)
+    model.load_state_dict(average_checkpoints(filenames, device=device), strict=strict)
+
+    return model
+
+
 def get_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -99,12 +163,20 @@ def get_parser():
         "Note: Epoch counts from 0.",
     )
     parser.add_argument(
+        "--step",
+        type=int,
+        default=None,
+        help="It specifies the maximum step to use for decoding. "
+        "If provided, will use step-based checkpoints instead of epoch-based. "
+        "Checkpoints will be loaded at 2000-step intervals up to this value.",
+    )
+    parser.add_argument(
         "--avg",
         type=int,
         default=55,
         help="Number of checkpoints to average. Automatically select "
         "consecutive checkpoints before the checkpoint specified by "
-        "'--epoch'. ",
+        "'--epoch' or at 2000-step intervals before '--step'. ",
     )
 
     parser.add_argument(
@@ -1063,12 +1135,24 @@ def main():
             distill_layers=distill_layers,
         )
         
-        if params.avg == 1:
-            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
+        if params.step is not None:
+            # Use step-based checkpoint loading (2000-step intervals)
+            if params.avg == 1:
+                checkpoint_path = f"{params.exp_dir}/step-{params.step}.pt"
+                logging.info(f"Loading single checkpoint: {checkpoint_path}")
+                load_checkpoint(checkpoint_path, model)
+            else:
+                model = load_averaged_model_step(
+                    params.exp_dir, model, params.step, params.avg, device, strict=True
+                )
         else:
-            model = load_averaged_model(
-                params.exp_dir, model, params.epoch, params.avg, device, strict=True
-            )
+            # Use epoch-based checkpoint loading (legacy)
+            if params.avg == 1:
+                load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
+            else:
+                model = load_averaged_model(
+                    params.exp_dir, model, params.epoch, params.avg, device, strict=True
+                )
 
     else:
         logging.info("Creating model WITHOUT projection layers")
@@ -1084,12 +1168,24 @@ def main():
             distill_layers=None,  # No distillation layers
         )
         
-        if params.avg == 1:
-            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
+        if params.step is not None:
+            # Use step-based checkpoint loading (2000-step intervals)
+            if params.avg == 1:
+                checkpoint_path = f"{params.exp_dir}/step-{params.step}.pt"
+                logging.info(f"Loading single checkpoint: {checkpoint_path}")
+                load_checkpoint(checkpoint_path, model)
+            else:
+                model = load_averaged_model_step(
+                    params.exp_dir, model, params.step, params.avg, device, strict=False
+                )
         else:
-            model = load_averaged_model(
-                params.exp_dir, model, params.epoch, params.avg, device, strict=False
-            )
+            # Use epoch-based checkpoint loading (legacy)
+            if params.avg == 1:
+                load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
+            else:
+                model = load_averaged_model(
+                    params.exp_dir, model, params.epoch, params.avg, device, strict=False
+                )
 
     model.to(device)
     model.eval()

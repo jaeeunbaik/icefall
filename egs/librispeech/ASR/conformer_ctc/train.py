@@ -31,6 +31,7 @@ Usage:
 import argparse
 import logging
 import warnings
+import sys
 from pathlib import Path
 from shutil import copyfile
 from typing import Optional, Tuple, List
@@ -467,6 +468,18 @@ def get_parser():
         default=3,
         help="When debug-train is true, log shapes/stats for the first N batches each epoch.",
     )
+
+    parser.add_argument(
+        "--init-model-from-pretrain",
+        type=str,
+        default="",
+        help="""Path to pretrained model checkpoint (e.g., from SSL pretraining).
+        If provided, the encoder weights will be loaded from this checkpoint.
+        The decoder will be randomly initialized. Example:
+        /path/to/librilight/SSL/conformer/exp/epoch-11.pt
+        """,
+    )
+
     return parser
 
 
@@ -546,8 +559,8 @@ def get_params() -> AttributeDict:
             "feature_dim": 80,
             "subsampling_factor": 4,
             "use_feat_batchnorm": True,
-            "attention_dim": 512,
-            "nhead": 8,
+            "attention_dim": 256,
+            "nhead": 4,
             # parameters for loss
             "beam_size": 20,
             "reduction": "sum",
@@ -613,6 +626,244 @@ def load_checkpoint_if_available(
         params[k] = saved_params[k]
 
     return saved_params
+
+
+def load_pretrained_encoder(
+    pretrain_path: str,
+    model: nn.Module,
+) -> None:
+    """Load pretrained encoder weights from SSL pretraining checkpoint.
+    
+    This function loads only the encoder weights from a pretrained checkpoint
+    (e.g., from LibriLight SSL pretraining). The decoder remains randomly initialized.
+    
+    Args:
+      pretrain_path:
+        Path to the pretrained checkpoint file (e.g., epoch-11.pt from SSL training).
+      model:
+        The Conformer model to load encoder weights into.
+    """
+    if not pretrain_path or pretrain_path == "":
+        return
+    
+    logging.info(f"Loading pretrained encoder from {pretrain_path}")
+
+    # Add safe globals for weights_only=True
+    from pathlib import PosixPath, WindowsPath
+    torch.serialization.add_safe_globals([PosixPath, WindowsPath])
+
+    # Also allow-list PrototypeKMeansManager if available to avoid weights_only errors
+    try:
+        try:
+            from k_means_clustering import PrototypeKMeansManager  # SSL path
+        except Exception:
+            # Try likely local recipe path for the class
+            candidate_paths = [
+                str(Path(__file__).resolve().parent / 'conformer_ctc_sd_proj'),
+                '/home/hdd2/jenny/ASRToolkit/icefall/egs/librilight/SSL/conformer',
+                '/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj',
+            ]
+            for p in candidate_paths:
+                if p not in sys.path:
+                    sys.path.append(p)
+            from k_means_clustering import PrototypeKMeansManager  # type: ignore
+        # If import succeeded, register it
+        torch.serialization.add_safe_globals([PrototypeKMeansManager])
+    except Exception:
+        # It's okay if we can't import; we'll still try to load weights only
+        pass
+
+    # Try to load checkpoint with weights_only=False to handle custom objects
+    try:
+        checkpoint = torch.load(pretrain_path, map_location="cpu", weights_only=False)
+        logging.info("Checkpoint loaded successfully")
+    except ModuleNotFoundError as e:
+        logging.warning(f"ModuleNotFoundError: {e}")
+        logging.warning("Attempting to load with weights_only=True (ignoring custom objects)")
+        try:
+            checkpoint = torch.load(pretrain_path, map_location="cpu", weights_only=True)
+            logging.info("Checkpoint loaded successfully (weights only)")
+        except Exception as e2:
+            logging.error(f"Failed to load checkpoint: {e2}")
+            raise
+    except Exception as e:
+        logging.error(f"Failed to load checkpoint: {e}")
+        raise
+    
+    # Get the state dict - handle both DDP and non-DDP checkpoints
+    # Rank-aware logging to avoid 4x spam in DDP
+    def _get_rank() -> int:
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                return torch.distributed.get_rank()
+        except Exception:
+            pass
+        return 0
+
+    rank = _get_rank()
+
+    if "model" in checkpoint:
+        pretrained_state = checkpoint["model"]
+        if rank == 0:
+            logging.info("Found 'model' key in checkpoint")
+    else:
+        pretrained_state = checkpoint
+        if rank == 0:
+            logging.info("Using checkpoint directly as state dict")
+    
+    # Filter encoder weights only
+    encoder_state = {}
+    for key, value in pretrained_state.items():
+        # Remove 'module.' prefix if present (from DDP)
+        clean_key = key.replace("module.", "")
+        
+        # Load encoder weights only (exclude decoder)
+        if clean_key.startswith("encoder."):
+            encoder_state[clean_key] = value
+    
+    if rank == 0:
+        logging.info(f"Found {len(encoder_state)} encoder parameters in checkpoint")
+    
+    # Snapshot model state BEFORE loading
+    model_state_before = {k: v.clone() for k, v in model.state_dict().items() if k.startswith("encoder.")}
+    
+    # Load with strict=False to allow partial loading
+    missing_keys, unexpected_keys = model.load_state_dict(encoder_state, strict=False)
+    
+    # Get model state AFTER loading
+    model_state_after = model.state_dict()
+    
+    # Verify what was actually loaded by comparing weights
+    actually_loaded = 0
+    actually_changed = 0
+    shape_mismatches = []
+    skipped_keys = []
+    
+    # Collect concise samples instead of logging every single param
+    sample_limit = 5  # keep logs short; show at most N examples per category
+    samples_loaded_verified = []
+    samples_loaded_matched = []
+    samples_skipped_mismatch = []
+    samples_skipped_missing = []
+
+    for key, pretrained_value in encoder_state.items():
+        if key in model_state_after:
+            model_value_after = model_state_after[key]
+            
+            if pretrained_value.shape == model_value_after.shape:
+                # Check if weights actually changed
+                model_value_before = model_state_before.get(key)
+                if model_value_before is not None:
+                    # Compare actual weight values
+                    weights_changed = not torch.equal(model_value_before, model_value_after)
+                    weights_match_pretrained = torch.allclose(model_value_after, pretrained_value, rtol=1e-5, atol=1e-8)
+                    
+                    if weights_changed and weights_match_pretrained:
+                        actually_loaded += 1
+                        actually_changed += 1
+                        if rank == 0 and len(samples_loaded_verified) < sample_limit:
+                            samples_loaded_verified.append(f"{key} {tuple(pretrained_value.shape)}")
+                    elif weights_match_pretrained:
+                        actually_loaded += 1
+                        if rank == 0 and len(samples_loaded_matched) < sample_limit:
+                            samples_loaded_matched.append(f"{key} {tuple(pretrained_value.shape)}")
+                    else:
+                        if rank == 0 and len(samples_skipped_mismatch) < sample_limit:
+                            samples_skipped_mismatch.append(f"{key} shape={tuple(pretrained_value.shape)}")
+                        skipped_keys.append(key)
+                else:
+                    # No before state (shouldn't happen)
+                    actually_loaded += 1
+                    if rank == 0 and len(samples_loaded_verified) < sample_limit:
+                        samples_loaded_verified.append(f"{key} {tuple(pretrained_value.shape)}")
+            else:
+                shape_mismatches.append(
+                    f"{key}: pretrained {pretrained_value.shape} != model {model_value_after.shape}"
+                )
+                skipped_keys.append(key)
+                if rank == 0 and len(samples_skipped_mismatch) < sample_limit:
+                    samples_skipped_mismatch.append(f"{key} pretrained={tuple(pretrained_value.shape)} model={tuple(model_value_after.shape)}")
+        else:
+            if rank == 0 and len(samples_skipped_missing) < sample_limit:
+                samples_skipped_missing.append(key)
+            skipped_keys.append(key)
+    
+    # Report results
+    if rank == 0:
+        logging.info("=" * 80)
+        logging.info(f"Pretrained Weight Loading Summary:")
+        logging.info(f"  Total pretrained params: {len(encoder_state)}")
+        logging.info(f"  Successfully loaded: {actually_loaded}")
+        logging.info(f"  Weights changed from random init: {actually_changed}")
+        logging.info(f"  Skipped (mismatch/missing): {len(skipped_keys)}")
+        # Show a few examples per category (at most sample_limit each)
+        if samples_loaded_verified:
+            logging.info(f"  Examples LOADED & VERIFIED (<= {sample_limit}):")
+            for s in samples_loaded_verified:
+                logging.info(f"    - {s}")
+        if samples_loaded_matched:
+            logging.info(f"  Examples LOADED (already matched) (<= {sample_limit}):")
+            for s in samples_loaded_matched:
+                logging.info(f"    - {s}")
+        if samples_skipped_mismatch:
+            logging.info(f"  Examples SKIPPED (mismatch) (<= {sample_limit}):")
+            for s in samples_skipped_mismatch:
+                logging.info(f"    - {s}")
+        if samples_skipped_missing:
+            logging.info(f"  Examples SKIPPED (key not in model) (<= {sample_limit}):")
+            for s in samples_skipped_missing:
+                logging.info(f"    - {s}")
+    
+    # Check decoder remained random
+    decoder_keys = [k for k in model_state_after.keys() if k.startswith("decoder.")]
+    if decoder_keys and rank == 0:
+        logging.info(f"  Decoder params (random init): {len(decoder_keys)}")
+    
+    if shape_mismatches:
+        if rank == 0:
+            logging.error("=" * 80)
+            logging.error("CRITICAL: Shape mismatches detected!")
+            # Print at most first few mismatches
+            for msg in shape_mismatches[:sample_limit]:
+                logging.error(f"  {msg}")
+            if len(shape_mismatches) > sample_limit:
+                logging.error(f"  ... and {len(shape_mismatches) - sample_limit} more")
+            logging.error("These layers are using RANDOM INITIALIZATION!")
+            logging.error("=" * 80)
+        
+        # Raise error if too many mismatches (likely wrong checkpoint)
+        mismatch_ratio = len(shape_mismatches) / len(encoder_state)
+        if mismatch_ratio > 0.5:
+            raise ValueError(
+                f"Too many shape mismatches ({len(shape_mismatches)}/{len(encoder_state)} = {mismatch_ratio:.1%})! "
+                "You may be loading a checkpoint with different d_model or num_layers. "
+                "Please check:\n"
+                f"  1. Pretrained checkpoint: {pretrain_path}\n"
+                f"  2. Model architecture: check d_model and num_layers\n"
+                "Common issues:\n"
+                "  - d_model mismatch (e.g., pretrained=256 vs current=512)\n"
+                "  - Different number of layers\n"
+                "  - Wrong checkpoint file"
+            )
+    
+    if actually_loaded == 0:
+        raise ValueError(
+            "ERROR: No parameters were loaded from pretrained checkpoint! "
+            "This usually means:\n"
+            f"  1. All parameters have shape mismatches (check d_model)\n"
+            f"  2. Wrong checkpoint format\n"
+            f"  3. Checkpoint path: {pretrain_path}\n"
+            f"Please verify the checkpoint is compatible with current model."
+        )
+    
+    if actually_changed == 0 and len(encoder_state) > 0 and rank == 0:
+        logging.warning("WARNING: Weights were 'loaded' but none changed from initialization!")
+        logging.warning("This might indicate the checkpoint contains the same random init.")
+
+    if rank == 0:
+        logging.info(f"✓ Encoder: Loaded {actually_loaded} pretrained parameters ({actually_changed} changed)")
+        logging.info(f"✓ Decoder: Randomly initialized")
+        logging.info("=" * 80)
 
 
 def save_checkpoint(
@@ -721,102 +972,6 @@ def compute_loss(
         allow_truncate=max(params.subsampling_factor - 1, 10),
     )
 
-    # # Enhanced debugging before CTC loss computation - DISABLED FOR SPEED
-    # if params.get("debug_train", False) and hasattr(params, 'batch_idx_train') and params.batch_idx_train % 25 == 0:
-    #     with torch.no_grad():
-    #         # Analyze model outputs
-    #         probs = torch.exp(nnet_output)  # Convert log_softmax to probabilities
-    #         max_probs, predicted_tokens = torch.max(probs, dim=-1)
-    #         
-    #         # Blank token analysis (blank is ID 0)
-    #         blank_prob = probs[:, :, 0].mean().item()
-    #         avg_max_prob = max_probs.mean().item()
-    #         
-    #         # Token diversity analysis
-    #         flat_predictions = predicted_tokens.flatten()
-    #         unique_predictions = torch.unique(flat_predictions).numel()
-    #         total_vocab = probs.size(-1)
-    #         
-    #         # Most frequent predicted tokens
-    #         token_counts = torch.bincount(flat_predictions, minlength=min(50, total_vocab))
-    #         top_tokens = torch.topk(token_counts, k=min(5, total_vocab)).indices.tolist()
-    #         
-    #         # Check for pathological behaviors
-    #         warnings = []
-    #         if unique_predictions < 10:
-    #             warnings.append(f"Low diversity: only {unique_predictions} tokens")
-    #         if blank_prob > 0.9:
-    #             warnings.append(f"High blank prob: {blank_prob:.3f}")
-    #         if avg_max_prob > 0.99:
-    #             warnings.append(f"Over-confident: {avg_max_prob:.3f}")
-    #         
-    #         # Improved greedy decoding for debugging with actual text conversion
-    #         batch_size = min(2, nnet_output.size(0))  # Check first 2 utterances
-    #         
-    #         logging.info(f"[DEBUG] Model Output Analysis (Step {params.batch_idx_train}):")
-    #         logging.info(f"  Blank prob: {blank_prob:.3f}, Avg conf: {avg_max_prob:.3f}")
-    #         logging.info(f"  Token diversity: {unique_predictions}/{total_vocab}")
-    #         logging.info(f"  Top predicted tokens: {top_tokens}")
-    #         if warnings:
-    #             logging.warning(f"  WARNINGS: {'; '.join(warnings)}")
-    #         
-    #         # Show actual predictions vs ground truth for first few utterances
-    #         for utt_idx in range(batch_size):
-    #             try:
-    #                 # Get ground truth text
-    #                 gt_text = texts[utt_idx] if utt_idx < len(texts) else "N/A"
-    #                 
-    #                 # Simple greedy decoding
-    #                 greedy_predictions = predicted_tokens[utt_idx]  # This utterance
-    #                 non_blank_mask = greedy_predictions != 0  # Remove blanks
-    #                 non_blank_tokens = greedy_predictions[non_blank_mask]
-    #                 
-    #                 # Remove consecutive duplicates (basic CTC decoding)
-    #                 if len(non_blank_tokens) > 0:
-    #                     unique_tokens = [non_blank_tokens[0].item()]
-    #                     for i in range(1, len(non_blank_tokens)):
-    #                         if non_blank_tokens[i] != non_blank_tokens[i-1]:
-    #                             unique_tokens.append(non_blank_tokens[i].item())
-    #                     
-    #                     # Convert to readable text using BPE model
-    #                     try:
-    #                         # Load BPE model for decoding
-    #                         if isinstance(graph_compiler, BpeCtcTrainingGraphCompiler):
-    #                             # For BPE-based system, load sentencepiece model
-    #                             import sentencepiece as spm
-    #                             sp = smp.SentencePieceProcessor()
-    #                             sp.load(str(params.lang_dir / "bpe.model"))
-    #                             predicted_text = sp.decode_ids(unique_tokens)
-    #                         else:
-    #                             # For phone-based system, convert token IDs to text
-    #                             predicted_text = f"Token IDs: {unique_tokens[:15]}"  # Show first 15 tokens
-    #                     except Exception as e:
-    #                         predicted_text = f"Token IDs: {unique_tokens[:15]} (decode error: {e})"
-    #                 else:
-    #                     predicted_text = "<EMPTY>"
-    #                 
-    #                 # Log comparison
-    #                 logging.info(f"  Utterance {utt_idx+1}:")
-    #                 logging.info(f"    GT: {gt_text}")
-    #                 logging.info(f"    PR: {predicted_text}")
-    #                 
-    #                 # Quick analysis
-    #                 if predicted_text == "<EMPTY>":
-    #                     logging.warning(f"    --> ⚠️  EMPTY PREDICTION (potential local minimum)")
-    #                 elif len(unique_tokens) == 1:
-    #                     logging.warning(f"    --> ⚠️  SINGLE TOKEN REPEATED (token ID: {unique_tokens[0]})")
-    #                 elif predicted_text.strip().upper() == gt_text.strip().upper():
-    #                     logging.info(f"    --> ✅ PERFECT MATCH!")
-    #                 else:
-    #                     logging.info(f"    --> 📝 Different prediction")
-    #                     
-    #             except Exception as e:
-    #                 logging.warning(f"  Utterance {utt_idx+1}: Debug error - {e}")
-    #         
-    #         logging.info(f"  " + "="*60)
-    #         if warnings:
-    #             logging.warning(f"  WARNINGS: {'; '.join(warnings)}")
-
     ctc_loss = k2.ctc_loss(
         decoding_graph=decoding_graph,
         dense_fsa_vec=dense_fsa_vec,
@@ -824,33 +979,6 @@ def compute_loss(
         reduction=params.reduction,
         use_double_scores=params.use_double_scores,
     )
-
-    # # Lightweight debugging stats - DISABLED FOR SPEED
-    # if params.get("debug_train", False) and hasattr(params, 'batch_idx_train') and params.batch_idx_train % 100 == 0:
-    #     # Lightweight stats on logits/probs - only every 100 batches to minimize overhead
-    #     with torch.no_grad():
-    #         # Use small slice directly without copying full tensor
-    #         batch_slice = min(2, nnet_output.size(0))
-    #         time_slice = min(5, nnet_output.size(1))
-    #         x_small = nnet_output[:batch_slice, :time_slice, :].detach()
-    #         
-    #         stats = {
-    #             "nnet_out_mean": float(x_small.mean().cpu()),
-    #             "nnet_out_std": float(x_small.std().cpu()),
-    #             "ctc_loss": float(ctc_loss.detach().cpu()),
-    #         }
-    #         
-    #         # More efficient blank prob calculation
-    #         log_probs = x_small.log_softmax(dim=-1)  # Direct log_softmax
-    #         blank_id = getattr(params, "blank_id", 0)
-    #         stats["blank_prob_mean"] = float(log_probs[..., blank_id].exp().mean().cpu())
-    #         
-    #         # Simplified entropy calculation
-    #         probs = log_probs.exp()
-    #         entropy = -(probs * log_probs).sum(dim=-1).mean()
-    #         stats["token_entropy"] = float(entropy.cpu())
-    #         
-    #         logging.debug(f"[DEBUG] Lightweight stats: {stats}")
 
     if params.att_rate != 0.0:
         with torch.set_grad_enabled(is_training):
@@ -1168,18 +1296,6 @@ def train_one_epoch(
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
 
-        # # Optional: for first few batches, log supervision/frame stats - DISABLED FOR SPEED
-        # if params.get("debug_train", False) and batch_idx < params.get("debug_first_n_batches", 3):
-        #     sv = batch["supervisions"]
-        #     try:
-        #         avg_len = float(sv["num_frames"].float().mean().item())
-        #         min_len = int(sv["num_frames"].min().item())
-        #         max_len = int(sv["num_frames"].max().item())
-        #         logging.debug(
-        #             f"[DEBUG] batch {batch_idx}: num_frames avg={avg_len:.1f} min={min_len} max={max_len}"
-        #         )
-        #     except Exception:
-        #         pass
 
         loss, loss_info = compute_loss(
             params=params,
@@ -1206,59 +1322,7 @@ def train_one_epoch(
                 f"tot_loss[{tot_loss}], batch size: {batch_size}"
             )
             
-            # # Quick prediction sampling for local minimum detection - DISABLED FOR SPEED
-            # if params.get("debug_train", False):
-            #     # Quick check for local minimum by doing a simple greedy decode on one sample
-            #     try:
-            #         with torch.no_grad():
-            #             model.eval()
-            #             feature = batch["inputs"][:1]  # Just first sample
-            #             supervisions_single = {k: v[:1] if isinstance(v, (list, torch.Tensor)) else [v[0]] 
-            #                                  for k, v in batch["supervisions"].items()}
-            #             
-            #             nnet_output, _, _ = model(feature, supervisions_single)
-            #             predicted_tokens = torch.argmax(nnet_output, dim=-1)[0]  # First (and only) utterance
-            #             
-            #             # Simple CTC decode: remove blanks and consecutive duplicates
-            #             non_blank_mask = predicted_tokens != 0
-            #             non_blank_tokens = predicted_tokens[non_blank_mask]
-            #             
-            #             if len(non_blank_tokens) > 0:
-            #                 unique_tokens = [non_blank_tokens[0].item()]
-            #                 for i in range(1, len(non_blank_tokens)):
-            #                     if non_blank_tokens[i] != non_blank_tokens[i-1]:
-            #                         unique_tokens.append(non_blank_tokens[i].item())
-            #                 
-            #                 # Convert to text if possible
-            #                 try:
-            #                     if isinstance(graph_compiler, BpeCtcTrainingGraphCompiler):
-            #                         import sentencepiece as smp
-            #                         sp = smp.SentencePieceProcessor()
-            #                         sp.load(str(params.lang_dir / "bpe.model"))
-            #                         predicted_text = sp.decode_ids(unique_tokens)
-            #                     else:
-            #                         predicted_text = f"Tokens: {unique_tokens[:10]}"
-            #                 except:
-            #                     predicted_text = f"IDs: {unique_tokens[:10]}"
-            #             else:
-            #                 predicted_text = "<EMPTY>"
-            #                 
-            #             # Get ground truth
-            #             gt_text = batch["supervisions"]["text"][0] if "text" in batch["supervisions"] else "N/A"
-            #             
-            #             # Log quick comparison
-            #             if predicted_text == "<EMPTY>":
-            #                 logging.warning(f"[QUICK-CHECK] ⚠️  EMPTY prediction (GT: {gt_text[:50]}...)")
-            #             elif len(unique_tokens) == 1:
-            #                 logging.warning(f"[QUICK-CHECK] ⚠️  SINGLE TOKEN ({unique_tokens[0]}) repeated (GT: {gt_text[:50]}...)")
-            #             else:
-            #                 logging.info(f"[QUICK-CHECK] PR: {predicted_text[:50]}... | GT: {gt_text[:50]}...")
-            #             
-            #             model.train()
-            #             
-            #     except Exception as e:
-            #         logging.debug(f"[QUICK-CHECK] Error: {e}")
-            #         model.train()
+
                     
             if params.get("debug_train", False):
                 try:
@@ -1268,43 +1332,6 @@ def train_one_epoch(
                 if cur_lr is not None:
                     logging.info(f"[DEBUG] lr={cur_lr:.6e}")
                 
-                # # Enhanced debugging every 50 batches - DISABLED FOR SPEED
-                # if batch_idx % 50 == 0:
-                #     # Loss analysis
-                #     current_ctc_loss = loss_info["ctc_loss"] / loss_info["frames"]
-                #     avg_ctc_loss = tot_loss["ctc_loss"] / tot_loss["frames"]
-                #     
-                #     # Gradient analysis
-                #     total_grad_norm = 0.0
-                #     param_count = 0
-                #     for param in model.parameters():
-                #         if param.grad is not None:
-                #             grad_norm = param.grad.data.norm(2).item()
-                #             total_grad_norm += grad_norm ** 2
-                #             param_count += 1
-                #     
-                #     if param_count > 0:
-                #         total_grad_norm = (total_grad_norm ** 0.5)
-                #         
-                #         logging.info(f"[DEBUG] Detailed Analysis:")
-                #         logging.info(f"  - CTC loss per frame: curr={current_ctc_loss:.4f}, avg={avg_ctc_loss:.4f}")
-                #         logging.info(f"  - Gradient norm: {total_grad_norm:.4f}")
-                #         
-                #         # Gradient warnings
-                #         if total_grad_norm < 1e-6:
-                #             logging.warning("[DEBUG] WARNING: Very small gradients - vanishing gradient problem")
-                #         elif total_grad_norm > 100:
-                #             logging.warning(f"[DEBUG] WARNING: Large gradients ({total_grad_norm:.2f}) - exploding gradient")
-                #         
-                #         # Learning progress (simplified)
-                #         if batch_idx > 100:
-                #             recent_loss = loss_info["loss"]
-                #             if hasattr(params, '_last_debug_loss'):
-                #                 loss_change = params._last_debug_loss - recent_loss
-                #                 logging.info(f"  - Loss change since last debug: {loss_change:.4f}")
-                #                 if abs(loss_change) < 0.001:
-                #                     logging.warning("[DEBUG] WARNING: Loss plateau - very slow improvement")
-                #             params._last_debug_loss = recent_loss
 
         if batch_idx % params.log_interval == 0:
             if tb_writer is not None:
@@ -1465,11 +1492,15 @@ def run(rank, world_size, args):
         d_model=params.attention_dim,
         num_classes=num_classes,
         subsampling_factor=params.subsampling_factor,
-        num_encoder_layers=12,
+        num_encoder_layers=18,
         num_decoder_layers=params.num_decoder_layers,
         vgg_frontend=False,
         use_feat_batchnorm=params.use_feat_batchnorm,
     )
+    
+    # Load pretrained encoder weights if provided
+    if params.init_model_from_pretrain:
+        load_pretrained_encoder(params.init_model_from_pretrain, model)
     
     checkpoints = load_checkpoint_if_available(params=params, model=model)
 

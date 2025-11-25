@@ -46,6 +46,78 @@ from torch.utils.data import DataLoader
 from icefall.utils import str2bool
 
 
+class LibriLightDataset:
+    """
+    Custom dataset for LibriLight unlabeled data.
+    Similar to lhotse's K2SpeechRecognitionDataset but handles unlabeled data gracefully.
+    """
+    def __init__(self, input_strategy=None, cut_transforms=None, input_transforms=None, return_cuts=False):
+        self.input_strategy = input_strategy
+        self.cut_transforms = cut_transforms or []
+        self.input_transforms = input_transforms or []
+        self.return_cuts = return_cuts
+    
+    def __getitem__(self, cuts):
+        """
+        Process cuts and return batch compatible with ASR training.
+        Handles unlabeled data by creating minimal supervisions.
+        """
+        from lhotse import CutSet
+        from lhotse.dataset.collation import collate_features
+        import torch
+        
+        # Ensure cuts is a CutSet
+        if not isinstance(cuts, CutSet):
+            cuts = CutSet.from_cuts([cuts])
+        
+        # Apply cut transforms
+        for transform in self.cut_transforms:
+            cuts = transform(cuts)
+        
+        # Extract features
+        if self.input_strategy is not None:
+            features = self.input_strategy(cuts)
+            # input_strategy might return tuple (features, features_lens)
+            if isinstance(features, tuple):
+                features = features[0]  # Take only features, ignore lengths
+        else:
+            # Fallback: use precomputed features
+            features_list = []
+            for cut in cuts:
+                feat = cut.load_features()
+                features_list.append(torch.from_numpy(feat))
+            features = collate_features(features_list)
+            # collate_features might return tuple
+            if isinstance(features, tuple):
+                features = features[0]
+        
+        # Ensure features is a tensor
+        if not isinstance(features, torch.Tensor):
+            raise TypeError(f"Expected features to be torch.Tensor, got {type(features)}")
+        
+        # Apply input transforms (e.g., SpecAugment)
+        for transform in self.input_transforms:
+            features = transform(features)
+        
+        # Create minimal supervisions for unlabeled data
+        supervisions = {
+            'sequence_idx': torch.arange(len(cuts)),
+            'start_frame': torch.zeros(len(cuts), dtype=torch.int32),
+            'num_frames': torch.tensor([cut.num_frames for cut in cuts], dtype=torch.int32),
+            'text': [''] * len(cuts),  # Empty text for unlabeled data
+        }
+        
+        batch = {
+            'inputs': features,
+            'supervisions': supervisions,
+        }
+        
+        if self.return_cuts:
+            batch['supervisions']['cut'] = list(cuts)
+        
+        return batch
+
+
 class CleanNoisyWrapper:
     """
     Wrapper for creating GUARANTEED clean-noisy pairs from identical source cuts.
@@ -69,35 +141,50 @@ class CleanNoisyWrapper:
         }
     }
     """
-    def __init__(self, base_dataset, augmentation_transforms=None, input_transforms=None):
+    def __init__(self, base_dataset, clean_cut_transforms=None, clean_input_transforms=None, 
+                 noisy_cut_transforms=None, noisy_input_transforms=None):
         """
         Args:
-            base_dataset: K2SpeechRecognitionDataset (clean, no transforms)
-            augmentation_transforms: List of cut transforms for noisy version
-            input_transforms: List of input transforms (e.g., SpecAugment) for noisy
+            base_dataset: K2SpeechRecognitionDataset (no transforms)
+            clean_cut_transforms: List of cut transforms for clean version
+            clean_input_transforms: List of input transforms (e.g., SpecAugment) for clean
+            noisy_cut_transforms: List of cut transforms for noisy version
+            noisy_input_transforms: List of input transforms (e.g., SpecAugment) for noisy
         """
         self.base_dataset = base_dataset
-        self.augmentation_transforms = augmentation_transforms or []
-        self.input_transforms = input_transforms or []
+        self.clean_cut_transforms = clean_cut_transforms or []
+        self.clean_input_transforms = clean_input_transforms or []
+        self.noisy_cut_transforms = noisy_cut_transforms or []
+        self.noisy_input_transforms = noisy_input_transforms or []
         
-        logging.info("CleanNoisyWrapper initialized")
-        logging.info(f"Augmentation transforms: {[type(t).__name__ for t in self.augmentation_transforms]}")
-        logging.info(f"Input transforms: {[type(t).__name__ for t in self.input_transforms]}")
+        logging.info("CleanNoisyWrapper initialized with separate clean/noisy augmentations")
+        logging.info(f"Clean cut transforms: {[type(t).__name__ for t in self.clean_cut_transforms]}")
+        logging.info(f"Clean input transforms: {[type(t).__name__ for t in self.clean_input_transforms]}")
+        logging.info(f"Noisy cut transforms: {[type(t).__name__ for t in self.noisy_cut_transforms]}")
+        logging.info(f"Noisy input transforms: {[type(t).__name__ for t in self.noisy_input_transforms]}")
     
     def __getitem__(self, cuts):
         """
-        GUARANTEED clean-noisy alignment by processing same cuts twice.
+        GUARANTEED clean-noisy alignment by processing same cuts twice with different transforms.
         
         Process:
-        1. Get clean version from base dataset (no transforms)
-        2. Apply transforms to same cuts for noisy version
-        3. Both versions have identical source → Perfect alignment
+        1. Get base version from base dataset (no transforms)
+        2. Apply clean transforms to create clean version
+        3. Apply noisy transforms to create noisy version
+        4. Both versions have identical source → Perfect alignment
         """
-        # Step 1: Get clean version (original, no augmentation)
-        clean_batch = self.base_dataset[cuts]
+        # Step 1: Get base version (original, no augmentation)
+        base_batch = self.base_dataset[cuts]
         
-        # Step 2: Create noisy version by applying transforms to same cuts
-        noisy_batch = self._create_noisy_version(cuts, clean_batch)
+        # Step 2: Create clean version by applying clean transforms to same cuts
+        clean_batch = self._create_augmented_version(cuts, base_batch, 
+                                                      self.clean_cut_transforms, 
+                                                      self.clean_input_transforms)
+        
+        # Step 3: Create noisy version by applying noisy transforms to same cuts
+        noisy_batch = self._create_augmented_version(cuts, base_batch, 
+                                                      self.noisy_cut_transforms, 
+                                                      self.noisy_input_transforms)
         
         # Clean-Noisy alignment verified and working correctly
         
@@ -116,64 +203,105 @@ class CleanNoisyWrapper:
             }
         }
     
-    def _create_noisy_version(self, cuts, clean_batch):
+    def _create_augmented_version(self, cuts, base_batch, cut_transforms, input_transforms):
         """
-        동일한 cuts에서 noisy 버전 생성 - 완전히 동일한 소스 보장
+        동일한 cuts에서 augmented 버전 생성 - 완전히 동일한 소스 보장
         
-        전략: Clean batch의 supervisions는 그대로 복사 (100% 동일성 보장)
+        전략: Base batch의 supervisions는 그대로 복사 (100% 동일성 보장)
               Features만 증강 적용으로 변경
+        
+        Args:
+            cuts: Original CutSet
+            base_batch: Base batch (no augmentation)
+            cut_transforms: List of cut transforms to apply
+            input_transforms: List of input transforms to apply
         """
         try:
             import torch
             
-            # Step 1: Clean의 supervisions를 그대로 복사 (완벽한 동일성 보장)
-            noisy_supervisions = {}
-            for key, value in clean_batch['supervisions'].items():
-                if isinstance(value, torch.Tensor):
-                    noisy_supervisions[key] = value.clone()
-                elif isinstance(value, (list, tuple)):
-                    noisy_supervisions[key] = list(value)  # 리스트 복사
-                else:
-                    noisy_supervisions[key] = value
+            # Validate base_batch structure
+            if not isinstance(base_batch, dict):
+                raise TypeError(f"base_batch must be dict, got {type(base_batch)}")
+            if 'inputs' not in base_batch:
+                raise KeyError("base_batch missing 'inputs' key")
+            if 'supervisions' not in base_batch:
+                raise KeyError("base_batch missing 'supervisions' key")
             
-            # Step 2: Features 시작점은 clean과 동일
-            noisy_inputs = clean_batch['inputs'].clone()
+            # Validate inputs is tensor
+            base_inputs = base_batch['inputs']
+            if not isinstance(base_inputs, torch.Tensor):
+                raise TypeError(f"base_batch['inputs'] must be torch.Tensor, got {type(base_inputs)}")
+            
+            # Step 1: Base의 supervisions를 그대로 복사 (완벽한 동일성 보장)
+            augmented_supervisions = {}
+            for key, value in base_batch['supervisions'].items():
+                if isinstance(value, torch.Tensor):
+                    augmented_supervisions[key] = value.clone()
+                elif isinstance(value, (list, tuple)):
+                    augmented_supervisions[key] = list(value)  # 리스트 복사
+                else:
+                    augmented_supervisions[key] = value
+            
+            # Step 2: Features 시작점은 base와 동일
+            augmented_inputs = base_inputs.clone()
             
             # Step 3: Input transforms 적용 (SpecAugment 등)
-            # 이것만 차이가 나고, 나머지는 모두 동일
-            if self.input_transforms:
-                for transform in self.input_transforms:
+            if input_transforms:
+                for transform in input_transforms:
                     try:
                         if hasattr(transform, '__call__'):
-                            noisy_inputs = transform(noisy_inputs)
+                            augmented_inputs = transform(augmented_inputs)
                     except Exception as e:
                         logging.warning(f"Input transform {type(transform).__name__} failed: {e}")
             
             # Step 4: Cut-level transforms 시뮬레이션 (간단한 noise 추가 등)
             # 복잡한 Cut transforms (MUSAN 등)는 나중에 구현, 우선 SpecAugment만
-            if self.augmentation_transforms and len(self.augmentation_transforms) > 0:
+            if cut_transforms and len(cut_transforms) > 0:
                 # 간단한 noise 추가로 시뮬레이션 (실제 MUSAN은 복잡함)
-                logging.debug(f"Cut transforms present but simplified: {[type(t).__name__ for t in self.augmentation_transforms]}")
+                logging.debug(f"Cut transforms present but simplified: {[type(t).__name__ for t in cut_transforms]}")
                 # 실제 구현이 필요하면 여기에 추가
             
             # Step 5: 결과 생성
-            noisy_batch = {
-                'inputs': noisy_inputs,
-                'supervisions': noisy_supervisions  # 완전히 동일한 supervisions
+            augmented_batch = {
+                'inputs': augmented_inputs,
+                'supervisions': augmented_supervisions  # 완전히 동일한 supervisions
             }
             
-            return noisy_batch
+            return augmented_batch
             
         except Exception as e:
-            logging.error(f"Failed to create noisy version: {e}")
-            logging.error(f"Error details: {str(e)}")
-            logging.warning("Fallback: Using clean batch as noisy (no augmentation)")
+            logging.error(f"Failed to create augmented version: {e}")
+            logging.error(f"Error type: {type(e).__name__}")
+            logging.error(f"base_batch keys: {base_batch.keys() if isinstance(base_batch, dict) else 'Not a dict'}")
+            if isinstance(base_batch, dict) and 'inputs' in base_batch:
+                logging.error(f"base_batch['inputs'] type: {type(base_batch['inputs'])}")
+            logging.warning("Fallback: Using base batch without augmentation")
             
-            # Fallback: clean을 그대로 복사
+            # Fallback: base를 그대로 복사
             import torch
+            
+            # Safe copy of inputs
+            if isinstance(base_batch.get('inputs'), torch.Tensor):
+                fallback_inputs = base_batch['inputs'].clone()
+            else:
+                fallback_inputs = base_batch['inputs']
+            
+            # Safe copy of supervisions
+            fallback_supervisions = {}
+            if isinstance(base_batch.get('supervisions'), dict):
+                for key, value in base_batch['supervisions'].items():
+                    if isinstance(value, torch.Tensor):
+                        fallback_supervisions[key] = value.clone()
+                    elif isinstance(value, (list, tuple)):
+                        fallback_supervisions[key] = list(value)
+                    else:
+                        fallback_supervisions[key] = value
+            else:
+                fallback_supervisions = base_batch.get('supervisions', {})
+            
             fallback_batch = {
-                'inputs': clean_batch['inputs'].clone() if hasattr(clean_batch['inputs'], 'clone') else clean_batch['inputs'],
-                'supervisions': clean_batch['supervisions'].copy()
+                'inputs': fallback_inputs,
+                'supervisions': fallback_supervisions
             }
             return fallback_batch
 
@@ -439,6 +567,166 @@ class LibriSpeechAsrDataModule:
             help="AudioSamples or PrecomputedFeatures",
         )
 
+        # ==================== CLEAN SAMPLE AUGMENTATION OPTIONS ====================
+        group.add_argument(
+            "--clean-enable-spec-aug",
+            type=str2bool,
+            default=False,
+            help="When enabled, apply SpecAugment to clean samples.",
+        )
+        group.add_argument(
+            "--clean-spec-aug-time-warp-factor",
+            type=int,
+            default=80,
+            help="Time warp factor for clean samples' SpecAugment.",
+        )
+        group.add_argument(
+            "--clean-spec-aug-num-frame-masks",
+            type=int,
+            default=2,
+            help="Number of time masks for clean samples.",
+        )
+        group.add_argument(
+            "--clean-spec-aug-features-mask-size",
+            type=int,
+            default=27,
+            help="Maximum width of frequency masks for clean samples.",
+        )
+        group.add_argument(
+            "--clean-spec-aug-num-feature-masks",
+            type=int,
+            default=10,
+            help="Number of frequency masks for clean samples.",
+        )
+        group.add_argument(
+            "--clean-spec-aug-frames-mask-size",
+            type=int,
+            default=100,
+            help="Maximum width of time masks for clean samples.",
+        )
+        group.add_argument(
+            "--clean-enable-musan",
+            type=str2bool,
+            default=False,
+            help="When enabled, apply MUSAN noise to clean samples.",
+        )
+        group.add_argument(
+            "--clean-musan-ratio",
+            type=float,
+            default=0.5,
+            help="Probability of applying MUSAN to clean samples.",
+        )
+        group.add_argument(
+            "--clean-snr-range",
+            type=str,
+            default="10,20",
+            help="SNR range for clean samples' MUSAN augmentation.",
+        )
+        group.add_argument(
+            "--clean-enable-cutmix",
+            type=str2bool,
+            default=False,
+            help="When enabled, apply CutMix to clean samples.",
+        )
+        group.add_argument(
+            "--clean-enable-concatenate",
+            type=str2bool,
+            default=False,
+            help="When enabled, concatenate cuts for clean samples.",
+        )
+        group.add_argument(
+            "--clean-enable-rir",
+            type=str2bool,
+            default=False,
+            help="When enabled, apply RIR reverberation to clean samples.",
+        )
+        group.add_argument(
+            "--clean-rir-prob",
+            type=float,
+            default=0.5,
+            help="Probability of applying RIR to clean samples.",
+        )
+
+        # ==================== NOISY SAMPLE AUGMENTATION OPTIONS ====================
+        group.add_argument(
+            "--noisy-enable-spec-aug",
+            type=str2bool,
+            default=True,
+            help="When enabled, apply SpecAugment to noisy samples.",
+        )
+        group.add_argument(
+            "--noisy-spec-aug-time-warp-factor",
+            type=int,
+            default=80,
+            help="Time warp factor for noisy samples' SpecAugment.",
+        )
+        group.add_argument(
+            "--noisy-spec-aug-num-frame-masks",
+            type=int,
+            default=2,
+            help="Number of time masks for noisy samples.",
+        )
+        group.add_argument(
+            "--noisy-spec-aug-features-mask-size",
+            type=int,
+            default=27,
+            help="Maximum width of frequency masks for noisy samples.",
+        )
+        group.add_argument(
+            "--noisy-spec-aug-num-feature-masks",
+            type=int,
+            default=10,
+            help="Number of frequency masks for noisy samples.",
+        )
+        group.add_argument(
+            "--noisy-spec-aug-frames-mask-size",
+            type=int,
+            default=100,
+            help="Maximum width of time masks for noisy samples.",
+        )
+        group.add_argument(
+            "--noisy-enable-musan",
+            type=str2bool,
+            default=False,
+            help="When enabled, apply MUSAN noise to noisy samples.",
+        )
+        group.add_argument(
+            "--noisy-musan-ratio",
+            type=float,
+            default=0.5,
+            help="Probability of applying MUSAN to noisy samples.",
+        )
+        group.add_argument(
+            "--noisy-snr-range",
+            type=str,
+            default="10,20",
+            help="SNR range for noisy samples' MUSAN augmentation.",
+        )
+        group.add_argument(
+            "--noisy-enable-cutmix",
+            type=str2bool,
+            default=False,
+            help="When enabled, apply CutMix to noisy samples.",
+        )
+        group.add_argument(
+            "--noisy-enable-concatenate",
+            type=str2bool,
+            default=False,
+            help="When enabled, concatenate cuts for noisy samples.",
+        )
+        group.add_argument(
+            "--noisy-enable-rir",
+            type=str2bool,
+            default=True,
+            help="When enabled, apply RIR reverberation to noisy samples.",
+        )
+        group.add_argument(
+            "--noisy-rir-prob",
+            type=float,
+            default=0.5,
+            help="Probability of applying RIR to noisy samples.",
+        )
+
     def train_dataloaders(
         self,
         cuts_train: CutSet,
@@ -477,144 +765,235 @@ class LibriSpeechAsrDataModule:
                 logging.info(f"Combined dataset: {len(cuts_train)} cuts total")
                 logging.info(f"LibriLight ratio: ~{ratio:.2f}")
 
-        # Setup augmentation transforms (for noisy dataset)
-        transforms = []
-        min_snr, max_snr = list(map(int, self.args.snr_range.split(',')))
+        # ==================== CLEAN TRANSFORMS ====================
+        logging.info("=" * 60)
+        logging.info("Setting up CLEAN sample augmentations")
+        logging.info("=" * 60)
         
-        # Add RIR reverberation if enabled
-        if self.args.enable_rir:
-            logging.info("Enable RIR reverberation")
-            logging.info("Loading RIR impulse responses...")
-            
-            # Load RIR recordings from prepared manifest
+        clean_transforms = []
+        if hasattr(self.args, 'clean_snr_range'):
+            clean_min_snr, clean_max_snr = list(map(int, self.args.clean_snr_range.split(',')))
+        else:
+            clean_min_snr, clean_max_snr = 10, 20
+        
+        # Clean: RIR
+        if self.args.clean_enable_rir:
+            logging.info("[CLEAN] Enable RIR reverberation")
             rir_manifest_path = Path("data/fbank/rir_recordings.jsonl.gz")
             if rir_manifest_path.exists():
                 rir_recordings = load_manifest(rir_manifest_path)
-                logging.info(f"Loaded {len(rir_recordings)} RIR impulse responses")
-                
-                transforms.append(
+                logging.info(f"[CLEAN] Loaded {len(rir_recordings)} RIR impulse responses")
+                clean_transforms.append(
                     ReverbWithImpulseResponse(
                         rir_recordings=rir_recordings,
-                        p=self.args.rir_prob,
+                        p=self.args.clean_rir_prob,
                         normalize_output=True,
                         preserve_id=True,
-                        early_only=self.args.rir_early_only,
-                        rir_channels=[0],  # Use first channel
+                        early_only=False,
+                        rir_channels=[0],
                     )
                 )
-                logging.info(f"RIR config: prob={self.args.rir_prob}, early_only={self.args.rir_early_only}")
+                logging.info(f"[CLEAN] RIR config: prob={self.args.clean_rir_prob}")
             else:
-                logging.warning(f"RIR manifest not found at {rir_manifest_path}")
-                logging.warning("Please run: bash prepare_rir_data.sh to generate RIR data")
-                logging.warning("Continuing without RIR augmentation")
+                logging.warning(f"[CLEAN] RIR manifest not found, skipping")
         else:
-            logging.info("Disable RIR reverberation")
+            logging.info("[CLEAN] Disable RIR reverberation")
         
-        if self.args.enable_musan:
-            logging.info("Enable MUSAN")
-            logging.info("About to get Musan cuts")
+        # Clean: MUSAN
+        if self.args.clean_enable_musan:
+            logging.info("[CLEAN] Enable MUSAN")
             cuts_musan = load_manifest("data/fbank/musan_cuts.jsonl.gz")
-            transforms.append(
-                CutMix(cuts=cuts_musan, p=self.args.musan_ratio, snr=(min_snr, max_snr), preserve_id=True)
+            clean_transforms.append(
+                CutMix(cuts=cuts_musan, p=self.args.clean_musan_ratio, snr=(clean_min_snr, clean_max_snr), preserve_id=True)
             )
+            logging.info(f"[CLEAN] MUSAN config: prob={self.args.clean_musan_ratio}, SNR=({clean_min_snr}, {clean_max_snr})")
         else:
-            logging.info("Disable MUSAN")
+            logging.info("[CLEAN] Disable MUSAN")
 
-        if self.args.concatenate_cuts:
-            logging.info(
-                f"Using cut concatenation with duration factor "
-                f"{self.args.duration_factor} and gap {self.args.gap}."
-            )
-            # Cut concatenation should be the first transform in the list,
-            # so that if we e.g. mix noise in, it will fill the gaps between
-            # different utterances.
-            transforms = [
+        # Clean: Concatenation
+        if self.args.clean_enable_concatenate:
+            logging.info(f"[CLEAN] Enable cut concatenation")
+            clean_transforms = [
                 CutConcatenate(
                     duration_factor=self.args.duration_factor, gap=self.args.gap
                 )
-            ] + transforms
+            ] + clean_transforms
 
-        input_transforms = []
-        if self.args.enable_spec_aug:
-            logging.info("Enable SpecAugment")
-            logging.info(f"Time warp factor: {self.args.spec_aug_time_warp_factor}")
-            # Set the value of num_frame_masks according to Lhotse's version.
-            # In different Lhotse's versions, the default of num_frame_masks is
-            # different.
-            num_frame_masks = self.args.spec_aug_num_frame_masks
+        # Clean: Input transforms (SpecAugment)
+        clean_input_transforms = []
+        if self.args.clean_enable_spec_aug:
+            logging.info("[CLEAN] Enable SpecAugment")
+            logging.info(f"[CLEAN] Time warp factor: {self.args.clean_spec_aug_time_warp_factor}")
+            num_frame_masks = self.args.clean_spec_aug_num_frame_masks
             num_frame_masks_parameter = inspect.signature(
                 SpecAugment.__init__
             ).parameters["num_frame_masks"]
             if num_frame_masks_parameter.default == 1:
-                num_frame_masks = self.args.spec_aug_num_frame_masks
-            logging.info(f"Num frame mask: {num_frame_masks}")
-            input_transforms.append(
+                num_frame_masks = self.args.clean_spec_aug_num_frame_masks
+            logging.info(f"[CLEAN] Num frame mask: {num_frame_masks}")
+            clean_input_transforms.append(
                 SpecAugment(
-                    time_warp_factor=self.args.spec_aug_time_warp_factor,
+                    time_warp_factor=self.args.clean_spec_aug_time_warp_factor,
                     num_frame_masks=num_frame_masks,
-                    features_mask_size=self.args.spec_aug_features_mask_size,
-                    num_feature_masks=self.args.spec_aug_num_feature_masks,
-                    frames_mask_size=self.args.spec_aug_frames_mask_size,
+                    features_mask_size=self.args.clean_spec_aug_features_mask_size,
+                    num_feature_masks=self.args.clean_spec_aug_num_feature_masks,
+                    frames_mask_size=self.args.clean_spec_aug_frames_mask_size,
                 )
             )
         else:
-            logging.info("Disable SpecAugment")
+            logging.info("[CLEAN] Disable SpecAugment")
+
+        logging.info(f"[CLEAN] Total: {len(clean_transforms)} cut transforms, {len(clean_input_transforms)} input transforms")
+        
+        # ==================== NOISY TRANSFORMS ====================
+        logging.info("=" * 60)
+        logging.info("Setting up NOISY sample augmentations")
+        logging.info("=" * 60)
+        
+        noisy_transforms = []
+        if hasattr(self.args, 'noisy_snr_range'):
+            noisy_min_snr, noisy_max_snr = list(map(int, self.args.noisy_snr_range.split(',')))
+        else:
+            noisy_min_snr, noisy_max_snr = 10, 20
+        
+        # Noisy: RIR
+        if self.args.noisy_enable_rir:
+            logging.info("[NOISY] Enable RIR reverberation")
+            rir_manifest_path = Path("data/fbank/rir_recordings.jsonl.gz")
+            if rir_manifest_path.exists():
+                rir_recordings = load_manifest(rir_manifest_path)
+                logging.info(f"[NOISY] Loaded {len(rir_recordings)} RIR impulse responses")
+                noisy_transforms.append(
+                    ReverbWithImpulseResponse(
+                        rir_recordings=rir_recordings,
+                        p=self.args.noisy_rir_prob,
+                        normalize_output=True,
+                        preserve_id=True,
+                        early_only=self.args.rir_early_only,
+                        rir_channels=[0],
+                    )
+                )
+                logging.info(f"[NOISY] RIR config: prob={self.args.noisy_rir_prob}, early_only={self.args.rir_early_only}")
+            else:
+                logging.warning(f"[NOISY] RIR manifest not found, skipping")
+        else:
+            logging.info("[NOISY] Disable RIR reverberation")
+        
+        # Noisy: MUSAN
+        if self.args.noisy_enable_musan:
+            logging.info("[NOISY] Enable MUSAN")
+            cuts_musan = load_manifest("data/fbank/musan_cuts.jsonl.gz")
+            noisy_transforms.append(
+                CutMix(cuts=cuts_musan, p=self.args.noisy_musan_ratio, snr=(noisy_min_snr, noisy_max_snr), preserve_id=True)
+            )
+            logging.info(f"[NOISY] MUSAN config: prob={self.args.noisy_musan_ratio}, SNR=({noisy_min_snr}, {noisy_max_snr})")
+        else:
+            logging.info("[NOISY] Disable MUSAN")
+
+        # Noisy: Concatenation
+        if self.args.noisy_enable_concatenate:
+            logging.info(f"[NOISY] Enable cut concatenation")
+            noisy_transforms = [
+                CutConcatenate(
+                    duration_factor=self.args.duration_factor, gap=self.args.gap
+                )
+            ] + noisy_transforms
+
+        # Noisy: Input transforms (SpecAugment)
+        noisy_input_transforms = []
+        if self.args.noisy_enable_spec_aug:
+            logging.info("[NOISY] Enable SpecAugment")
+            logging.info(f"[NOISY] Time warp factor: {self.args.noisy_spec_aug_time_warp_factor}")
+            num_frame_masks = self.args.noisy_spec_aug_num_frame_masks
+            num_frame_masks_parameter = inspect.signature(
+                SpecAugment.__init__
+            ).parameters["num_frame_masks"]
+            if num_frame_masks_parameter.default == 1:
+                num_frame_masks = self.args.noisy_spec_aug_num_frame_masks
+            logging.info(f"[NOISY] Num frame mask: {num_frame_masks}")
+            noisy_input_transforms.append(
+                SpecAugment(
+                    time_warp_factor=self.args.noisy_spec_aug_time_warp_factor,
+                    num_frame_masks=num_frame_masks,
+                    features_mask_size=self.args.noisy_spec_aug_features_mask_size,
+                    num_feature_masks=self.args.noisy_spec_aug_num_feature_masks,
+                    frames_mask_size=self.args.noisy_spec_aug_frames_mask_size,
+                )
+            )
+        else:
+            logging.info("[NOISY] Disable SpecAugment")
+
+        logging.info(f"[NOISY] Total: {len(noisy_transforms)} cut transforms, {len(noisy_input_transforms)} input transforms")
+        logging.info("=" * 60)
 
         # Create input strategy (same for both clean and noisy - only transforms differ)
         input_strategy = eval(self.args.input_strategy)()
         if self.args.on_the_fly_feats:
             input_strategy = OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80)))
         
-        # Create clean dataset (no augmentation)
-        # Create train dataset (with augmentations)
-        logging.info("About to create train dataset")
-        augmentation_details = []
-        if transforms:
-            transform_names = [type(t).__name__ for t in transforms]
-            augmentation_details.append(f"Cut transforms: {transform_names}")
-        if input_transforms:
-            input_transform_names = [type(t).__name__ for t in input_transforms]
-            augmentation_details.append(f"Input transforms: {input_transform_names}")
-        
-        if augmentation_details:
-            logging.info(f"Train dataset augmentations: {'; '.join(augmentation_details)}")
-        else:
-            logging.info("Train dataset: No augmentations will be applied")
-        
-        logging.info(f"Train dataset: {len(transforms)} cut transforms, {len(input_transforms)} input transforms")
-        
         # Check if self-distillation is enabled
         enable_self_distillation = getattr(self.args, 'enable_self_distillation', False)
+        learning_type = getattr(self.args, 'learning_type', 'asr')
         
-        if enable_self_distillation:
+        # Determine if using LibriLight (unlabeled data)
+        use_librilight = getattr(self.args, 'dataset_type', 'librispeech') == 'librilight' or \
+                        learning_type == 'encoder-only'
+        
+        # Use clean/noisy separation ONLY when:
+        # 1. Self-distillation is enabled AND
+        # 2. Learning type is NOT standard 'asr'
+        use_clean_noisy_separation = enable_self_distillation and learning_type != 'asr'
+        
+        if use_clean_noisy_separation:
             logging.info("Creating clean-noisy dataset pairs for self-distillation")
             
-            # Create single base dataset (clean, no augmentation)
-            base_dataset = K2SpeechRecognitionDataset(
+            # Choose dataset class based on data type
+            if use_librilight:
+                logging.info("Using LibriLightDataset for unlabeled data")
+                DatasetClass = LibriLightDataset
+            else:
+                logging.info("Using K2SpeechRecognitionDataset for labeled data")
+                DatasetClass = K2SpeechRecognitionDataset
+            
+            # Create single base dataset (no augmentation)
+            base_dataset = DatasetClass(
                 input_strategy=input_strategy,
-                cut_transforms=[],  # No cut augmentations for base (clean) version
-                input_transforms=[],  # No input augmentations for base (clean) version  
+                cut_transforms=[],  # No cut augmentations for base version
+                input_transforms=[],  # No input augmentations for base version  
                 return_cuts=self.args.return_cuts,
             )
             
             # Create wrapper that uses same cuts for both clean and noisy
-            # Clean = base dataset as-is
-            # Noisy = same cuts + augmentation transforms applied on-the-fly
+            # Clean = clean transforms applied
+            # Noisy = noisy transforms applied
             train = CleanNoisyWrapper(
                 base_dataset=base_dataset,
-                augmentation_transforms=transforms,  # Cut transforms (MUSAN, RIR, etc)
-                input_transforms=input_transforms   # Input transforms (SpecAugment, etc)
+                clean_cut_transforms=clean_transforms,  # Cut transforms for clean samples
+                clean_input_transforms=clean_input_transforms,  # Input transforms for clean samples
+                noisy_cut_transforms=noisy_transforms,  # Cut transforms for noisy samples
+                noisy_input_transforms=noisy_input_transforms   # Input transforms for noisy samples
             )
             
-            logging.info("Using single base dataset with on-the-fly augmentation")
+            logging.info("Using single base dataset with separate clean/noisy augmentations")
         else:
-            # Standard training (no self-distillation)
-            train = K2SpeechRecognitionDataset(
-                input_strategy=input_strategy,
-                cut_transforms=transforms,  # Apply cut augmentations (MUSAN, RIR, concat)
-                input_transforms=input_transforms,  # Apply input augmentations (SpecAugment)
-                return_cuts=self.args.return_cuts,
-            )
+            # Standard ASR training or when self-distillation is disabled
+            # Use --noisy-* augmentation settings
+            logging.info("Standard mode: Using --noisy-* augmentation settings")
+            if use_librilight:
+                logging.info("Using LibriLightDataset for unlabeled data (standard mode)")
+                train = LibriLightDataset(
+                    input_strategy=input_strategy,
+                    cut_transforms=noisy_transforms,
+                    input_transforms=noisy_input_transforms,
+                    return_cuts=self.args.return_cuts,
+                )
+            else:
+                train = K2SpeechRecognitionDataset(
+                    input_strategy=input_strategy,
+                    cut_transforms=noisy_transforms,  # Apply cut augmentations (MUSAN, RIR, concat)
+                    input_transforms=noisy_input_transforms,  # Apply input augmentations (SpecAugment)
+                    return_cuts=self.args.return_cuts,
+                )
 
         # Determine shuffle value
         shuffle_val = self.args.shuffle if shuffle is None else shuffle
@@ -1052,24 +1431,47 @@ class LibriLightAsrDataModule(LibriSpeechAsrDataModule):
         subset = self.args.librilight_subset
         logging.info(f"Loading LibriLight {subset} training cuts")
         
-        # Construct manifest path
-        manifest_file = f"librilight_{subset}_cuts_train.jsonl.gz"
-        cuts_path = self.librilight_manifest_dir / manifest_file
+        # Check for sharded manifest files (e.g., librilight_cuts_medium.00000000.jsonl.gz)
+        sharded_pattern = f"librilight_cuts_{subset}.*.jsonl.gz"
+        sharded_files = sorted(self.librilight_manifest_dir.glob(sharded_pattern))
         
-        if not cuts_path.exists():
-            # Try alternative naming
-            alt_manifest_file = f"cuts_train_{subset}.jsonl.gz"
-            cuts_path = self.librilight_manifest_dir / alt_manifest_file
+        if sharded_files:
+            logging.info(f"Found {len(sharded_files)} sharded manifest files matching pattern: {sharded_pattern}")
+            for i, shard_path in enumerate(sharded_files):
+                logging.info(f"  Shard {i}: {shard_path.name}")
             
-        if not cuts_path.exists():
-            raise FileNotFoundError(
-                f"LibriLight training cuts not found at {cuts_path} or alternative paths.\n"
-                f"Please prepare LibriLight manifests first using prepare_librilight.sh"
-            )
+            # Load all shards using lhotse's combine (more efficient than from_files for lazy loading)
+            from lhotse import combine
+            logging.info(f"Loading {len(sharded_files)} shards from {self.librilight_manifest_dir}")
+            cuts = combine(load_manifest_lazy(str(f)) for f in sharded_files)
+            logging.info(f"Successfully loaded LibriLight {subset} training cuts from {len(sharded_files)} shards")
+        else:
+            # Try single-file manifest formats
+            manifest_file = f"librilight_{subset}_cuts_train.jsonl.gz"
+            cuts_path = self.librilight_manifest_dir / manifest_file
+            
+            if not cuts_path.exists():
+                # Try alternative naming
+                alt_manifest_file = f"cuts_train_{subset}.jsonl.gz"
+                cuts_path = self.librilight_manifest_dir / alt_manifest_file
+                
+            if not cuts_path.exists():
+                raise FileNotFoundError(
+                    f"LibriLight training cuts not found.\n"
+                    f"Tried:\n"
+                    f"  - Sharded pattern: {self.librilight_manifest_dir / sharded_pattern}\n"
+                    f"  - Single file: {self.librilight_manifest_dir / manifest_file}\n"
+                    f"  - Alternative: {self.librilight_manifest_dir / alt_manifest_file}\n"
+                    f"Please prepare LibriLight manifests first using prepare_librilight.sh"
+                )
+            
+            logging.info(f"Loading cuts from {cuts_path}")
+            cuts = load_manifest_lazy(cuts_path)
+            logging.info(f"Successfully loaded LibriLight {subset} training cuts")
         
-        logging.info(f"Loading cuts from {cuts_path}")
-        cuts = load_manifest_lazy(cuts_path)
-        logging.info(f"Successfully loaded {len(cuts)} LibriLight {subset} training cuts")
+        # Note: LibriLight cuts have supervisions with text=None
+        # lhotse's K2SpeechRecognitionDataset handles this gracefully
+        # No need to manually fix text values
         
         # Apply optional chunking and sampling only if explicitly enabled
         if hasattr(self.args, 'enable_librilight_chunking') and self.args.enable_librilight_chunking:
@@ -1122,7 +1524,17 @@ class LibriLightAsrDataModule(LibriSpeechAsrDataModule):
         subset = self.args.librilight_subset
         logging.info(f"Loading LibriLight {subset} development cuts")
         
-        # Try to load pre-saved LibriLight dev cuts first
+        # Check for sharded manifest files (e.g., librilight_cuts_medium_dev.00000000.jsonl.gz)
+        sharded_pattern = f"librilight_cuts_{subset}_dev.*.jsonl.gz"
+        sharded_files = sorted(self.librilight_manifest_dir.glob(sharded_pattern))
+        
+        if sharded_files:
+            logging.info(f"Found {len(sharded_files)} sharded dev manifest files")
+            cuts = CutSet.from_files([str(f) for f in sharded_files])
+            logging.info(f"Loaded {len(cuts)} LibriLight {subset} dev cuts from {len(sharded_files)} shards")
+            return cuts
+        
+        # Try single-file format
         manifest_file = f"librilight_{subset}_cuts_dev.jsonl.gz"
         cuts_path = self.librilight_manifest_dir / manifest_file
         

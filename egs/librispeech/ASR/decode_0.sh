@@ -21,9 +21,9 @@ fi
 
 CUDA_VISIBLE_DEVICES=0 python ./conformer_ctc_sd_proj/decode.py \
     --method ctc-decoding \
-    --max-duration 20 \
-    --epoch 0 \
-    --avg 1 \
-    --exp-dir /home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/finetuning/pretrained_6,12,18_avg11/models \
+    --max-duration 150 \
+    --epoch 2 \
+    --avg 3 \
+    --exp-dir conformer_ctc_sd_proj/finetuning/layer_weights/hybrid/exp_0.3-0.5-0.7/models \
     --include-proj-layer False \
     --distill-layers 3,5,14
