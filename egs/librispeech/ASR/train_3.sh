@@ -55,6 +55,7 @@ ema_decay=0.999
 ema_start_step=1000
 exp_dir=conformer_ctc_sd_proj/finetuning/exp_1125/exp_4,8,12
 
+
 # Data Augmentation Controls (modify these as needed)
 clean_enable_spec_aug=false          # SpecAugment (frequency/time masking)
 clean_enable_musan=false             # MUSAN noise augmentation

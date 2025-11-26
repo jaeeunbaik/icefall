@@ -411,14 +411,14 @@ def get_parser():
     parser.add_argument(
         "--prototype-dir",
         type=str,
-        default="./prototypes",
+        default="./prototypes/librilight-512",
         help="Directory to save/load prototypes. If directory doesn't exist, prototypes will be initialized.",
     )
     
     parser.add_argument(
         "--num-prototypes",
         type=int,
-        default=256,
+        default=512,
         help="Number of prototypes per layer for KL-based distillation (K value for K-means)",
     )
     
