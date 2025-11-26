@@ -25,7 +25,7 @@ num_decoder_layers=0          # 0 for pure CTC
 # Other settings
 start_epoch=0
 master_port=12346
-sanity_check=false           # Set to true for OOM checking (slower)
+sanity_check=false           # Set to true for OOM checking (slower)l
 resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/layer_weights/exp_0.3-0.5-0.7/models/averaged_10-20000.pt
 enable_validation=true       # Temporarily disable validation to avoid crashes
 valid_interval=10000           # Much larger interval if we enable validation later

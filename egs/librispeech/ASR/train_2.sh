@@ -10,7 +10,7 @@ set -euo pipefail
 
 # Training parameters
 world_size=1 
-max_duration=410
+max_duration=300
 valid_max_duration=15         
 num_buckets=300               
 num_workers=6    
@@ -25,7 +25,7 @@ num_decoder_layers=0          # 0 for pure CTC
 start_epoch=0
 master_port=12346
 sanity_check=false           # Set to true for OOM checking (slower)
-resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/exp_1125/exp_9,14,18/models/averaged_10-20000.pt
+resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/layer_weights/exp_0.5-0.5-1.0/models/averaged_10-20000.pt
 enable_validation=true       # Temporarily disable validation to avoid crashes
 valid_interval=10000           # Much larger interval if we enable validation later
 
@@ -45,7 +45,7 @@ validation_output_beam=5.0             # Output beam for validation (only used i
 validation_skip_wer=false              # Skip WER computation for even faster validation (디버깅용 - 이제 false로 변경)
 
 # Distillation Hyperparameters
-enable_self_distillation=False
+enable_self_distillation=true
 distill_layers=5,11,17
 distill_loss_type="kl"         # mse, cosine, kl
 alpha=1000
@@ -53,7 +53,7 @@ distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 
 distill_temperature=4.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_proj/finetuning/exp_1125/exp_9,14,18
+exp_dir=conformer_ctc_sd_proj/finetuning/hybrid/layer_weights/exp_0.5-0.5-1.0
 
 # Data Augmentation Controls (modify these as needed)
 clean_enable_spec_aug=false          # SpecAugment (frequency/time masking)
@@ -93,7 +93,7 @@ on_the_fly_feats=false
 
 
 #
-use_proj_layer=False
+use_proj_layer=true
 return_cuts=True
 on_the_fly_feats=False
 learning_type="hybrid"

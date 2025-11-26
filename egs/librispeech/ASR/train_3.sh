@@ -10,7 +10,7 @@ set -euo pipefail
 
 # Training parameters
 world_size=1 
-max_duration=410
+max_duration=300
 valid_max_duration=15         
 num_buckets=300               
 num_workers=6    
