@@ -1393,7 +1393,26 @@ def run(rank, world_size, args):
 
     librilight = LibriLightDataModule(args)
 
-    train_cuts = librilight.medium_cuts()
+    # Select dataset based on --dataset-type argument
+    dataset_type = getattr(params, 'dataset_type', 'librilight')
+    logging.info(f"Using dataset: {dataset_type}")
+    
+    if dataset_type == "librispeech":
+        logging.info("Loading LibriSpeech train-all-shuf cuts for pretraining")
+        train_cuts = librilight.librispeech_train_all_shuf_cuts()
+    elif dataset_type == "librilight":
+        logging.info("Loading LibriLight medium cuts for pretraining")
+        train_cuts = librilight.medium_cuts()
+    elif dataset_type == "auto":
+        # Auto mode: select based on learning_type
+        if getattr(params, 'learning_type', 'encoder-only') == 'encoder-only':
+            logging.info("Auto mode: using LibriLight (encoder-only training)")
+            train_cuts = librilight.medium_cuts()
+        else:
+            logging.info("Auto mode: using LibriSpeech (hybrid/asr training)")
+            train_cuts = librilight.librispeech_train_all_shuf_cuts()
+    else:
+        raise ValueError(f"Unknown dataset_type: {dataset_type}. Must be 'librilight', 'librispeech', or 'auto'")
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
@@ -1438,7 +1457,7 @@ def run(rank, world_size, args):
     # If requested, initialize prototypes once before training (rank 0 performs K-means).
     # Also allow initializing prototypes from an explicitly provided pretrain model
     pretrain_requested = params.initialize_prototypes
-    pretrain_loaded = params._loaded_pretrain
+    pretrain_loaded = getattr(params, '_loaded_pretrain', False)
     if (pretrain_requested or pretrain_loaded) and getattr(params, 'prototype_manager', None) is not None:
         if world_size > 1:
             torch.distributed.barrier()

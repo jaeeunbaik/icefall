@@ -186,9 +186,37 @@ class Transformer(nn.Module):
             x = x.permute(0, 2, 1)  # (N, C, T) -> (N, T, C)
         if isinstance(self.use_feat_batchnorm, float):
             x *= self.use_feat_batchnorm
-        encoder_memory, memory_key_padding_mask, layer_results, att_maps, encoder_output_original = self.run_encoder(x, supervision)
-        # Use original encoder output (256-dim) for CTC, not projected output
-        x = self.ctc_output(encoder_output_original)
+        
+        # run_encoder returns different values based on whether it's overridden (Conformer) or not (base Transformer)
+        encoder_output = self.run_encoder(x, supervision)
+        
+        # Check if run_encoder returned 5 values (Conformer) or 4 values (base Transformer)
+        if len(encoder_output) == 5:
+            # Conformer: (processed_output, mask, layer_results, att_maps, encoder_output_original)
+            # processed_output: went through proj_layer (for distillation)
+            # encoder_output_original: raw encoder output (d_model dimension, for CTC)
+            processed_output, memory_key_padding_mask, layer_results, att_maps, encoder_output_original = encoder_output
+            
+            # IMPORTANT: CTC loss should use encoder_output_original (NOT projected)
+            # Self-distillation uses processed_output (projected)
+            if self.ctc_output is not None:
+                # Apply CTC output layer to raw encoder output (d_model dimension)
+                x = self.ctc_output(encoder_output_original)
+            else:
+                # encoder-only mode: no CTC output needed
+                x = None
+            
+            # Use encoder_output_original as encoder_memory to keep d_model dimension for consistency
+            encoder_memory = encoder_output_original
+        else:
+            # Base Transformer: (encoder_output, mask, layer_results, att_maps)
+            encoder_memory, memory_key_padding_mask, layer_results, att_maps = encoder_output
+            # Apply ctc_output if available
+            if self.ctc_output is not None:
+                x = self.ctc_output(encoder_memory)
+            else:
+                x = encoder_memory
+        
         return x, encoder_memory, memory_key_padding_mask, layer_results, att_maps
 
     def run_encoder(

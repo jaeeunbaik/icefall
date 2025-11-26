@@ -116,38 +116,30 @@ class Conformer(Transformer):
             self.after_norm = identity
         
         self.use_proj_layer = use_proj_layer
-        # Set projection layer output dimension
-        # proj_dim: for prototype-based distillation (d_model -> smaller proj_dim)
-        # If None, keep d_model dimension for backward compatibility
-        self.proj_output_dim = proj_dim if proj_dim is not None else d_model
         
-        # Memory optimization: Skip projection layer creation for ASR-only mode
-        if use_proj_layer and learning_type != "asr":
+        self.proj_output_dim = proj_dim if proj_dim is not None else d_model
+        self.proj_layer = None    
+        if use_proj_layer:
             self.proj_layer = nn.Linear(d_model, self.proj_output_dim)
-            logging.info(f"Memory optimization: Created projection layer for {learning_type} mode")
-        elif learning_type == "asr":
-            self.proj_layer = None
-            logging.info(f"Memory optimization: Skipped projection layer for ASR-only mode")
-        else:
-            self.proj_layer = None
+            logging.info(f"Created projection layer (d_model={d_model} -> proj_dim={self.proj_output_dim}) for {learning_type} mode")
+    
         
         # Initialize distillation layer projection heads
-        self.distill_layers = distill_layers if distill_layers is not None else []
+        # Convert 1-based layer numbers to 0-based indices for internal use
+        if distill_layers is not None and len(distill_layers) > 0:
+            self.distill_layers = [layer - 1 for layer in distill_layers]
+            logging.info(f"Distillation layers (1-based input): {distill_layers} -> (0-based indices): {self.distill_layers}")
+        else:
+            self.distill_layers = []
         self.distill_projection_heads = nn.ModuleList()
         
-        # Memory optimization: Skip distillation projection heads for ASR-only mode
         if self.distill_layers and use_proj_layer and learning_type != "asr":
             for _ in self.distill_layers:
-                # Each distillation projection head maps d_model -> proj_output_dim
-                # This ensures consistency with prototypes that have shape [num_prototypes, proj_output_dim]
                 self.distill_projection_heads.append(nn.Linear(d_model, self.proj_output_dim))
             logging.info(f"Memory optimization: Created {len(self.distill_projection_heads)} distillation projection heads for {learning_type} mode")
-        elif learning_type == "asr":
-            logging.info(f"Memory optimization: Skipped distillation projection heads for ASR-only mode")
             
-        # Memory optimization: Remove CTC output layer for encoder-only mode
+        
         if learning_type == "encoder-only":
-            # Replace CTC output layers with dummy modules to save memory
             if hasattr(self, 'ctc_output'):
                 self.ctc_output = None
             if hasattr(self, 'linear'):
@@ -188,16 +180,20 @@ class Conformer(Transformer):
         if self.normalize_before:
             x = self.after_norm(x)
         
-        # Keep original encoder output for CTC (256-dim)
+        # Save original encoder output (d_model dimension) for CTC loss
         encoder_output_original = x
         
-        # Apply projection for distillation (128-dim) - Memory optimization
-        if self.use_proj_layer and self.proj_layer is not None:
+        # Apply projection layer for self-distillation loss
+        # IMPORTANT: Two separate paths:
+        #   - CTC loss: uses encoder_output_original (NOT projected)
+        #   - Self-distillation loss: uses x (projected through proj_layer)
+        if self.proj_layer is not None:
+            # Apply projection layer (d_model -> proj_dim) for distillation
             x = self.proj_layer(x)
-        elif self.learning_type == "asr":
-            # For ASR-only mode, no projection needed
-            pass
             
+        # Return values:
+        #   x: projected output for distillation (proj_dim)
+        #   encoder_output_original: raw encoder output for CTC (d_model)
         return x, mask, layer_results, att_maps, encoder_output_original
 
     def get_intermediate_outputs(
@@ -1224,9 +1220,6 @@ def compute_distillation_loss(
     min_threshold = 1e-5
     max_threshold = 1e2  # Prevent extremely large losses
     
-    # Log original values for analysis (less frequent)
-    if torch.rand(1).item() < 0.005:  # Log 0.5% of cases
-        logging.info(f"Distillation loss analysis - {loss_type}: original={loss_magnitude:.6f}")
     
     if loss_magnitude > 0:
         if loss_magnitude < min_threshold:
@@ -1352,19 +1345,6 @@ def compute_multi_layer_distillation_loss(
             loss_magnitude = loss.item()
             scale_factor = 1000.0  # Fixed multiplier to bring loss to reasonable scale
             
-            # Debug logging to track aggregation (reduced frequency)
-            if torch.rand(1).item() < 0.01:  # Log 1% of cases for debugging
-                logging.info(f"Aggregated loss before scaling: {loss_magnitude:.2e}")
-            
-            if loss_magnitude > 0:
-                # Apply fixed scaling to preserve relative differences
-                loss = loss * scale_factor
-                if torch.rand(1).item() < 0.05:  # Log 5% of scaling events
-                    logging.info(f"Fixed scaling by {scale_factor:.0f}x: "
-                               f"{loss_magnitude:.2e} -> {loss.item():.2e}")
-            
-            # Log the final loss value for monitoring
-            logging.debug(f"Final distillation loss: {loss.item():.6f} (scale_factor: {scale_factor:.1e})")
         else:
             loss = torch.tensor(0.0, device=device, requires_grad=True)
     else:

@@ -50,7 +50,7 @@ class PrototypeKMeansManager:
         proj_dim: int = 256,
         temperature: float = 2.0,
         use_pca: bool = True,  # Re-enabled for memory-efficient prototypes with projection layer
-        pca_dim: int = 128,
+        pca_dim: int = 256,
         device: torch.device = None,
         save_dir: str = "./prototypes"
     ):

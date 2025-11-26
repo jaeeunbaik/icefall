@@ -751,16 +751,127 @@ class LibriLightDataModule:
             ],
         )
 
-    # @lru_cache()
-    # def dev_clean_cuts(self) -> CutSet:
-    #     logging.info("About to get dev-clean cuts")
-    #     return load_manifest_lazy(
-    #         self.args.manifest_dir / "librispeech_cuts_dev-clean.jsonl.gz"
-    #     )
+    # LibriSpeech cuts methods for pretraining
+    @lru_cache()
+    def librispeech_train_clean_100_cuts(self) -> CutSet:
+        logging.info("About to get LibriSpeech train-clean-100 cuts")
+        # Try both locations: SSL data dir and LibriSpeech ASR data dir
+        candidate_paths = [
+            self.args.manifest_dir / "librispeech_cuts_train-clean-100.jsonl.gz",
+            Path("../../../librispeech/ASR/data/fbank/librispeech_cuts_train-clean-100.jsonl.gz"),
+            Path("/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/data/fbank/librispeech_cuts_train-clean-100.jsonl.gz"),
+        ]
+        for path in candidate_paths:
+            if path.exists():
+                logging.info(f"Loading from {path}")
+                return load_manifest_lazy(path)
+        raise FileNotFoundError(f"Could not find librispeech_cuts_train-clean-100.jsonl.gz in any of: {candidate_paths}")
 
-    # @lru_cache()
-    # def dev_other_cuts(self) -> CutSet:
-    #     logging.info("About to get dev-other cuts")
-    #     return load_manifest_lazy(
-    #         self.args.manifest_dir / "librispeech_cuts_dev-other.jsonl.gz"
-    #     )
+    @lru_cache()
+    def librispeech_train_clean_360_cuts(self) -> CutSet:
+        logging.info("About to get LibriSpeech train-clean-360 cuts")
+        candidate_paths = [
+            self.args.manifest_dir / "librispeech_cuts_train-clean-360.jsonl.gz",
+            Path("../../../librispeech/ASR/data/fbank/librispeech_cuts_train-clean-360.jsonl.gz"),
+            Path("/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/data/fbank/librispeech_cuts_train-clean-360.jsonl.gz"),
+        ]
+        for path in candidate_paths:
+            if path.exists():
+                logging.info(f"Loading from {path}")
+                return load_manifest_lazy(path)
+        raise FileNotFoundError(f"Could not find librispeech_cuts_train-clean-360.jsonl.gz in any of: {candidate_paths}")
+
+    @lru_cache()
+    def librispeech_train_other_500_cuts(self) -> CutSet:
+        logging.info("About to get LibriSpeech train-other-500 cuts")
+        candidate_paths = [
+            self.args.manifest_dir / "librispeech_cuts_train-other-500.jsonl.gz",
+            Path("../../../librispeech/ASR/data/fbank/librispeech_cuts_train-other-500.jsonl.gz"),
+            Path("/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/data/fbank/librispeech_cuts_train-other-500.jsonl.gz"),
+        ]
+        for path in candidate_paths:
+            if path.exists():
+                logging.info(f"Loading from {path}")
+                return load_manifest_lazy(path)
+        raise FileNotFoundError(f"Could not find librispeech_cuts_train-other-500.jsonl.gz in any of: {candidate_paths}")
+
+    @lru_cache()
+    def librispeech_train_all_shuf_cuts(self) -> CutSet:
+        logging.info("About to get LibriSpeech train-all-shuf cuts (train-clean-100, train-clean-360, train-other-500)")
+        # First try to load the pre-shuffled combined file
+        candidate_paths = [
+            self.args.manifest_dir / "librispeech_cuts_train-all-shuf.jsonl.gz",
+            Path("../../../librispeech/ASR/data/fbank/librispeech_cuts_train-all-shuf.jsonl.gz"),
+            Path("/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/data/fbank/librispeech_cuts_train-all-shuf.jsonl.gz"),
+        ]
+        for path in candidate_paths:
+            if path.exists():
+                logging.info(f"Loading pre-shuffled LibriSpeech cuts from {path}")
+                return load_manifest_lazy(path)
+        
+        # Fallback: load and combine individual files
+        logging.info("Pre-shuffled file not found, combining individual train sets")
+        try:
+            train_clean_100 = self.librispeech_train_clean_100_cuts()
+            train_clean_360 = self.librispeech_train_clean_360_cuts()
+            train_other_500 = self.librispeech_train_other_500_cuts()
+            return combine([train_clean_100, train_clean_360, train_other_500])
+        except FileNotFoundError as e:
+            logging.error(f"Failed to load LibriSpeech training cuts: {e}")
+            raise
+
+    @lru_cache()
+    def librispeech_dev_clean_cuts(self) -> CutSet:
+        logging.info("About to get LibriSpeech dev-clean cuts")
+        candidate_paths = [
+            self.args.manifest_dir / "librispeech_cuts_dev-clean.jsonl.gz",
+            Path("../../../librispeech/ASR/data/fbank/librispeech_cuts_dev-clean.jsonl.gz"),
+            Path("/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/data/fbank/librispeech_cuts_dev-clean.jsonl.gz"),
+        ]
+        for path in candidate_paths:
+            if path.exists():
+                logging.info(f"Loading from {path}")
+                return load_manifest_lazy(path)
+        raise FileNotFoundError(f"Could not find librispeech_cuts_dev-clean.jsonl.gz in any of: {candidate_paths}")
+
+    @lru_cache()
+    def librispeech_dev_other_cuts(self) -> CutSet:
+        logging.info("About to get LibriSpeech dev-other cuts")
+        candidate_paths = [
+            self.args.manifest_dir / "librispeech_cuts_dev-other.jsonl.gz",
+            Path("../../../librispeech/ASR/data/fbank/librispeech_cuts_dev-other.jsonl.gz"),
+            Path("/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/data/fbank/librispeech_cuts_dev-other.jsonl.gz"),
+        ]
+        for path in candidate_paths:
+            if path.exists():
+                logging.info(f"Loading from {path}")
+                return load_manifest_lazy(path)
+        raise FileNotFoundError(f"Could not find librispeech_cuts_dev-other.jsonl.gz in any of: {candidate_paths}")
+
+    @lru_cache()
+    def librispeech_test_clean_cuts(self) -> CutSet:
+        logging.info("About to get LibriSpeech test-clean cuts")
+        candidate_paths = [
+            self.args.manifest_dir / "librispeech_cuts_test-clean.jsonl.gz",
+            Path("../../../librispeech/ASR/data/fbank/librispeech_cuts_test-clean.jsonl.gz"),
+            Path("/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/data/fbank/librispeech_cuts_test-clean.jsonl.gz"),
+        ]
+        for path in candidate_paths:
+            if path.exists():
+                logging.info(f"Loading from {path}")
+                return load_manifest_lazy(path)
+        raise FileNotFoundError(f"Could not find librispeech_cuts_test-clean.jsonl.gz in any of: {candidate_paths}")
+
+    @lru_cache()
+    def librispeech_test_other_cuts(self) -> CutSet:
+        logging.info("About to get LibriSpeech test-other cuts")
+        candidate_paths = [
+            self.args.manifest_dir / "librispeech_cuts_test-other.jsonl.gz",
+            Path("../../../librispeech/ASR/data/fbank/librispeech_cuts_test-other.jsonl.gz"),
+            Path("/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/data/fbank/librispeech_cuts_test-other.jsonl.gz"),
+        ]
+        for path in candidate_paths:
+            if path.exists():
+                logging.info(f"Loading from {path}")
+                return load_manifest_lazy(path)
+        raise FileNotFoundError(f"Could not find librispeech_cuts_test-other.jsonl.gz in any of: {candidate_paths}")

@@ -13,7 +13,15 @@ def compute_mean_model(avg, epoch, model_fld, save_name):
         model_paths.append(model_path)
 
     # 3. 첫 모델의 state_dict 구조 기준으로 초기화
-    checkpoints = [torch.load(p, map_location='cpu', weights_only=False) for p in model_paths]
+    # 다양한 저장 포맷(전체 체크포인트 dict / 순수 state_dict)을 안전하게 로드
+    checkpoints = []
+    for p in model_paths:
+        ckpt = None
+        try:
+            ckpt = torch.load(p, map_location='cpu', weights_only=True)
+        except Exception:
+            ckpt = torch.load(p, map_location='cpu', weights_only=False)
+        checkpoints.append(ckpt)
     
     # Extract only the model state dict from each checkpoint
     state_dicts = []
@@ -41,20 +49,20 @@ def compute_mean_model(avg, epoch, model_fld, save_name):
         
         avg_state_dict[key] = avg_param
 
-    # 5. 기존 체크포인트 구조를 복제하고 model 부분만 교체
-    # 첫 번째 체크포인트의 전체 구조를 기준으로 복제
-    base_checkpoint = checkpoints[0].copy()
-    
-    # model 부분만 평균된 state_dict로 교체
-    base_checkpoint['model'] = avg_state_dict
-    
-    # 6. 평균 모델 저장 (전체 체크포인트 구조 유지)
-    torch.save(base_checkpoint, save_name)
-    print(f"평균 모델 저장 완료: {save_name}")
+    # 5. 최소 안전 포맷으로 저장: 모델 state_dict만 저장
+    safe_checkpoint = {
+        'model': avg_state_dict,
+        # 필요시 텐서/프리미티브 기반 메타데이터만 추가
+        # 'meta': {'averaged_from': model_paths, 'avg': len(state_dicts)}
+    }
+
+    # 6. 평균 모델 저장 (model state_dict만 포함)
+    torch.save(safe_checkpoint, save_name)
+    print(f"평균 모델 저장 완료(안전 포맷): {save_name}")
     
 if __name__=='__main__':
-    avg = 3
-    epoch = 2
-    model_fld = '/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/exp_kl_layer6,12,18/models'
-    save_name = 'pretrained_libri-light_6,12,18_avg3.pt'
+    avg = 6
+    epoch = 5
+    model_fld = '/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/finetuning/hybrid/layer_weights/exp_0.7-0.5-0.3/models'
+    save_name = '/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/finetuning/hybrid/layer_weights/exp_0.7-0.5-0.3/models/averaged-epoch5-avg6.pt'
     compute_mean_model(avg, epoch, model_fld, save_name)
