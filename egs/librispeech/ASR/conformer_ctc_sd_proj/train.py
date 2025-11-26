@@ -30,9 +30,10 @@ Usage:
 
 import argparse
 import logging
+import time
 from pathlib import Path
 from shutil import copyfile
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List
 import random
 import numpy as np
 
@@ -41,10 +42,10 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 import sentencepiece as spm
+from collections import defaultdict
 from asr_datamodule import LibriSpeechAsrDataModule, LibriLightAsrDataModule
 from conformer import Conformer
 from ema_teacher import EMATeacher
-from k_means_clustering import PrototypeKMeansManager
 from k_means_clustering import PrototypeKMeansManager
 from lhotse.cut import Cut
 from lhotse.utils import fix_random_seed
@@ -172,8 +173,9 @@ def get_parser():
     parser.add_argument(
         "--lr-factor",
         type=float,
-        default=5.0,
-        help="The lr_factor for Noam optimizer",
+        default=2.0,
+        help="The lr_factor for Noam optimizer. "
+        "Lower values (1.0-2.0) recommended for fine-tuning pretrained models",
     )
 
     parser.add_argument(
@@ -199,8 +201,9 @@ def get_parser():
     parser.add_argument(
         "--base-lr",
         type=float,
-        default=2e-5,
-        help="Base learning rate for plateau and constant schedulers",
+        default=5e-5,
+        help="Base learning rate for plateau and constant schedulers. "
+        "For fine-tuning pretrained models: 5e-5 (encoder) to 1e-4 (new CTC layer)",
     )
     
     parser.add_argument(
@@ -426,6 +429,21 @@ def get_parser():
         help="Number of feature samples per layer for prototype initialization using K-means",
     )
     
+    parser.add_argument(
+        "--recluster-prototypes-interval",
+        type=int,
+        default=0,
+        help="Re-cluster prototypes every N epochs. 0 means no reclustering (use initial prototypes only). "
+             "Recommended: 2-5 epochs for frequent updates, or 0 to disable.",
+    )
+    
+    parser.add_argument(
+        "--recluster-start-epoch",
+        type=int,
+        default=1,
+        help="Start re-clustering prototypes from this epoch. Default: 1 (re-cluster after first epoch)",
+    )
+    
     return parser
 
 
@@ -564,6 +582,64 @@ def load_checkpoint_if_available(
         if not filename.exists():
             logging.warning(f"Resume checkpoint not found at {filename}")
             return None
+        
+        logging.info(f"Loading pretrained checkpoint from: {filename}")
+        
+        # Load checkpoint with special handling for fine-tuning from pretrained encoder
+        checkpoint = torch.load(filename, map_location='cpu')
+        
+        if 'model' in checkpoint:
+            pretrained_state_dict = checkpoint['model']
+        else:
+            pretrained_state_dict = checkpoint
+        
+        # Get current model state dict
+        model_state_dict = model.state_dict()
+        
+        # Filter out keys that don't match or shouldn't be loaded
+        filtered_state_dict = {}
+        skipped_keys = []
+        new_keys = []
+        
+        for key, value in pretrained_state_dict.items():
+            if key in model_state_dict:
+                # Check if shapes match
+                if model_state_dict[key].shape == value.shape:
+                    filtered_state_dict[key] = value
+                else:
+                    skipped_keys.append(f"{key} (shape mismatch: {value.shape} vs {model_state_dict[key].shape})")
+            else:
+                skipped_keys.append(f"{key} (not in current model)")
+        
+        # Find keys in current model but not in pretrained checkpoint
+        for key in model_state_dict:
+            if key not in pretrained_state_dict:
+                new_keys.append(key)
+        
+        # Load the filtered state dict with strict=False
+        model.load_state_dict(filtered_state_dict, strict=False)
+        
+        logging.info(f"✓ Loaded {len(filtered_state_dict)} parameters from pretrained checkpoint")
+        if skipped_keys:
+            logging.info(f"⚠ Skipped {len(skipped_keys)} pretrained parameters (shape mismatch or not needed):")
+            for key in skipped_keys[:10]:  # Show first 10
+                logging.info(f"    - {key}")
+            if len(skipped_keys) > 10:
+                logging.info(f"    ... and {len(skipped_keys) - 10} more")
+        
+        if new_keys:
+            logging.info(f"⚠ {len(new_keys)} parameters will be randomly initialized (not in pretrained model):")
+            for key in new_keys[:10]:  # Show first 10
+                logging.info(f"    - {key}")
+            if len(new_keys) > 10:
+                logging.info(f"    ... and {len(new_keys) - 10} more")
+        
+        # Don't load training state from pretrained checkpoint
+        logging.info("Note: Training state (epoch, loss, optimizer) NOT loaded from pretrained checkpoint")
+        logging.info("      Starting fresh training with pretrained encoder weights")
+        
+        return None  # Don't load training state
+        
     else:
         if params.start_epoch <= 0:
             return None
@@ -593,12 +669,12 @@ def load_checkpoint_if_available(
     for k in keys:
         params[k] = saved_params[k]
 
-    # Load the full checkpoint data including optimizer state
-    full_checkpoint = torch.load(filename, map_location='cpu')
+    # Load the full checkpoint data
+    # We don't load optimizer state to avoid issues when optimizer type changes.
+    # full_checkpoint = torch.load(filename, map_location='cpu')
     
-    # Add optimizer state to saved_params if it exists
-    if 'optimizer' in full_checkpoint:
-        saved_params['optimizer'] = full_checkpoint['optimizer']
+    # if 'optimizer' in full_checkpoint:
+    #     saved_params['optimizer'] = full_checkpoint['optimizer']
 
     # Try to load EMA teacher checkpoint if it exists
     if ema_teacher is not None:
@@ -698,6 +774,102 @@ def save_checkpoint(
     # print("Saving All Done!")
 
 
+def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
+    """
+    Unwrap DDP model to access the underlying model.
+    
+    Args:
+        model: The model, which might be wrapped with DDP
+        
+    Returns:
+        The underlying model without DDP wrapper
+    """
+    if isinstance(model, DDP):
+        return model.module
+    return model
+
+
+def _extract_projected_outputs(
+    model: nn.Module,
+    layer_results: Optional[list],
+    distill_layers: list,
+    detach: bool = False,
+) -> list:
+    """
+    Extract and project intermediate layer outputs for distillation.
+    
+    Args:
+        model: The model (possibly wrapped with DDP)
+        layer_results: List of intermediate layer outputs from encoder
+        distill_layers: List of layer indices to use for distillation
+        detach: If True, detach outputs from computation graph (for teacher)
+        
+    Returns:
+        List of projected embeddings for distillation
+    """
+    if layer_results is None or not distill_layers:
+        return []
+    
+    unwrapped_model = _unwrap_ddp_model(model)
+    
+    # Extract outputs from selected layers
+    selected_outputs = []
+    for layer_idx in distill_layers:
+        if layer_idx < len(layer_results):
+            output = layer_results[layer_idx]
+            if detach:
+                output = output.detach()
+            selected_outputs.append(output)
+    
+    # Apply projection heads if available
+    # CRITICAL: If detach=True (teacher), wrap projection in no_grad()
+    if detach:
+        with torch.no_grad():
+            projected_embeddings = _apply_projection_heads(
+                unwrapped_model, selected_outputs, detach=True
+            )
+    else:
+        projected_embeddings = _apply_projection_heads(
+            unwrapped_model, selected_outputs, detach=False
+        )
+    
+    return projected_embeddings
+
+
+def _apply_projection_heads(
+    unwrapped_model: nn.Module,
+    selected_outputs: list,
+    detach: bool,
+) -> list:
+    """Apply projection heads to selected layer outputs."""
+    projected_embeddings = []
+    
+    if (hasattr(unwrapped_model, 'use_proj_layer') and unwrapped_model.use_proj_layer 
+        and hasattr(unwrapped_model, 'distill_projection_heads') 
+        and unwrapped_model.distill_projection_heads
+        and unwrapped_model.learning_type != "asr"):
+        
+        for i, layer_output in enumerate(selected_outputs):
+            if i < len(unwrapped_model.distill_projection_heads):
+                # Apply normalization if needed
+                if unwrapped_model.normalize_before and hasattr(unwrapped_model, 'after_norm'):
+                    normalized_output = unwrapped_model.after_norm(layer_output)
+                else:
+                    normalized_output = layer_output
+                
+                # Apply projection
+                projected = unwrapped_model.distill_projection_heads[i](normalized_output)
+                if detach:
+                    projected = projected.detach()
+                projected_embeddings.append(projected)
+            else:
+                projected_embeddings.append(layer_output)
+    else:
+        projected_embeddings = selected_outputs
+    
+    return projected_embeddings
+
+
 def compute_loss(
     params: AttributeDict,
     model: nn.Module,
@@ -775,8 +947,8 @@ def _compute_encoder_only_loss(
     assert clean_feature.ndim == 3 and noisy_feature.ndim == 3
     
     with torch.set_grad_enabled(is_training):
-        # Student forward pass (noisy sample)
-        _, _, _, _, _ = model(noisy_feature, noisy_supervisions)
+        # Student forward pass (noisy sample) - single forward call
+        _, _, _, student_layer_results, _ = model(noisy_feature, noisy_supervisions)
         
         # Get output lengths for distillation
         if isinstance(noisy_supervisions, dict) and 'num_frames' in noisy_supervisions:
@@ -790,27 +962,41 @@ def _compute_encoder_only_loss(
             seq_len = clean_feature.size(1) // params.subsampling_factor
             output_lens = [seq_len] * batch_size
         
-        # Teacher forward pass
-        if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-            teacher_model = ema_teacher.get_teacher_model()
-            with torch.no_grad():
-                teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
-        else:
-            with torch.no_grad():
-                teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
+        # Teacher forward pass (with no_grad)
+        teacher_layer_results = None
+        with torch.no_grad():
+            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+                teacher_model = ema_teacher.get_teacher_model()
+                _, _, _, teacher_layer_results, _ = teacher_model(clean_feature, clean_supervisions)
+            else:
+                _, _, _, teacher_layer_results, _ = model(clean_feature, clean_supervisions)
         
-        # Student projected outputs
-        student_projected_outputs = model.get_intermediate_outputs(noisy_feature, noisy_supervisions)
+        # Parse distillation layers
+        try:
+            distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
+        except:
+            distill_layers = [int(params.distill_layers)]
+        
+        # Extract projected outputs from already computed layer results
+        # IMPORTANT: Teacher must use detach=True to prevent gradient computation
+        teacher_projected_outputs = _extract_projected_outputs(
+            model=ema_teacher.get_teacher_model() if (ema_teacher is not None and params.batch_idx_train >= params.ema_start_step) else model,
+            layer_results=teacher_layer_results,
+            distill_layers=distill_layers,
+            detach=True,  # Detach teacher to prevent gradient
+        )
+        
+        # Student projection (needs gradient)
+        student_projected_outputs = _extract_projected_outputs(
+            model=model,
+            layer_results=student_layer_results,
+            distill_layers=distill_layers,
+            detach=False,  # Keep gradient for student
+        )
         
         # Compute distillation loss
         if teacher_projected_outputs and student_projected_outputs:
             from conformer import compute_multi_layer_distillation_loss
-            
-            # Parse distillation layers
-            try:
-                distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
-            except:
-                distill_layers = [int(params.distill_layers)]
             
             # Parse layer weights
             layer_weights = None
@@ -892,22 +1078,22 @@ def _compute_hybrid_loss(
     assert feature.ndim == 3
     
     with torch.set_grad_enabled(is_training):
-        # Forward pass
-        nnet_output, encoder_memory, memory_mask, _, _ = model(feature, supervisions)
+        # Student forward pass (noisy sample) - single forward call
+        nnet_output, encoder_memory, memory_mask, student_layer_results, _ = model(feature, supervisions)
         
-        # Compute CTC loss
+        # Compute student CTC loss
         s_ctc_loss, supervision_segments = compute_ctc_loss(params, graph_compiler, nnet_output, supervisions)
         
-        # Compute teacher CTC loss if clean samples available
+        # Teacher forward pass if clean samples available (with no_grad)
         t_output = None
+        teacher_layer_results = None
         if clean_feature is not None:
-            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-                teacher_model = ema_teacher.get_teacher_model()
-                with torch.no_grad():
-                    t_output, _, _, _, _ = teacher_model(clean_feature, clean_supervisions)
-            else:
-                with torch.no_grad():
-                    t_output, _, _, _, _ = model(clean_feature, clean_supervisions)
+            with torch.no_grad():
+                if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
+                    teacher_model = ema_teacher.get_teacher_model()
+                    t_output, _, _, teacher_layer_results, _ = teacher_model(clean_feature, clean_supervisions)
+                else:
+                    t_output, _, _, teacher_layer_results, _ = model(clean_feature, clean_supervisions)
                     
             if t_output is not None:
                 t_ctc_loss, _ = compute_ctc_loss(params, graph_compiler, t_output, clean_supervisions)
@@ -932,7 +1118,7 @@ def _compute_hybrid_loss(
         
         # Compute distillation loss if clean samples available
         distillation_loss = torch.tensor(0.0, device=model_device)
-        if clean_feature is not None:
+        if clean_feature is not None and teacher_layer_results is not None and student_layer_results is not None:
             # Get output lengths
             if isinstance(supervisions, dict) and 'num_frames' in supervisions:
                 original_lengths = supervisions['num_frames']
@@ -945,25 +1131,31 @@ def _compute_hybrid_loss(
                 seq_len = feature.size(1) // params.subsampling_factor
                 output_lens = [seq_len] * batch_size
             
-            # Get projected outputs for distillation
-            if ema_teacher is not None and params.batch_idx_train >= params.ema_start_step:
-                teacher_model = ema_teacher.get_teacher_model()
-                with torch.no_grad():
-                    teacher_projected_outputs = teacher_model.get_intermediate_outputs(clean_feature, clean_supervisions)
-            else:
-                with torch.no_grad():
-                    teacher_projected_outputs = model.get_intermediate_outputs(clean_feature, clean_supervisions)
+            # Parse distillation layers
+            try:
+                distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
+            except:
+                distill_layers = [int(params.distill_layers)]
             
-            student_projected_outputs = model.get_intermediate_outputs(feature, supervisions)
+            # Extract projected outputs from already computed layer results
+            # IMPORTANT: Teacher must use detach=True to prevent gradient computation
+            teacher_projected_outputs = _extract_projected_outputs(
+                model=ema_teacher.get_teacher_model() if (ema_teacher is not None and params.batch_idx_train >= params.ema_start_step) else model,
+                layer_results=teacher_layer_results,
+                distill_layers=distill_layers,
+                detach=True,  # Detach teacher to prevent gradient
+            )
+            
+            # Student projection (needs gradient)
+            student_projected_outputs = _extract_projected_outputs(
+                model=model,
+                layer_results=student_layer_results,
+                distill_layers=distill_layers,
+                detach=False,  # Keep gradient for student
+            )
             
             if teacher_projected_outputs and student_projected_outputs:
                 from conformer import compute_multi_layer_distillation_loss
-                
-                # Parse distillation layers
-                try:
-                    distill_layers = [int(x.strip()) for x in params.distill_layers.split(',')]
-                except:
-                    distill_layers = [int(params.distill_layers)]
                 
                 # Parse layer weights
                 layer_weights = None
@@ -1123,16 +1315,21 @@ def compute_validation_loss(
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
     epoch: int = 1,
-    quick_validation: bool = True,  # Add option for quick validation
-    rank: int = 0,  # Add rank parameter
-    tb_writer: Optional[SummaryWriter] = None,  # Add TensorBoard writer parameter
-) -> MetricsTracker:
-
+    quick_validation: bool = True,
+    rank: int = 0,
+    tb_writer: Optional[SummaryWriter] = None,
+) -> Tuple[MetricsTracker, Optional[float]]:
+    """
+    Compute validation loss and optionally WER.
+    Returns:
+        Tuple of (loss_metrics, wer_value)
+    """
     
     model.eval()
+    device = next(model.parameters()).device
     
     with torch.no_grad():
-        device = next(model.parameters()).device
+        # Step 1: Compute validation loss
         tot_loss = MetricsTracker()
         
         for batch_idx, batch in enumerate(valid_dl):
@@ -1142,7 +1339,7 @@ def compute_validation_loss(
                 batch=batch,
                 graph_compiler=graph_compiler,
                 is_training=False,
-                prototype_manager=None,  # Validation doesn't need prototype manager
+                prototype_manager=None,
             )
             
             assert loss.requires_grad is False
@@ -1153,184 +1350,558 @@ def compute_validation_loss(
             params.best_valid_epoch = params.cur_epoch
             params.best_valid_loss = loss_value
 
-        logging.info("Validation loss computation completed")
+        logging.info(f"Validation loss: {loss_value:.4f}")
 
-        # Check if WER computation should be skipped
+        # Step 2: Check if WER computation should be skipped
         if params.validation_skip_wer:
             logging.info("Skipping WER computation as requested")
             return tot_loss, None
 
-        # TODO: Re-enable WER computation after fixing decode_dataset issues
-        # Always compute WER for analysis
+        # Step 3: WER computation based on decode.py
         logging.info("Starting WER computation...")
         
-        # Use the existing graph_compiler instead of creating a new one
-        # to ensure device compatibility in DDP training
-        sos_id = graph_compiler.sos_id
-        eos_id = graph_compiler.eos_id
-        
-        # Read vocab size from tokens.txt
-        tokens_file = params.lang_dir / "tokens.txt"
-        with open(tokens_file, 'r', encoding='utf-8') as f:
-            vocab_size = len(f.readlines())
-        max_token_id = vocab_size - 1
-
-        # WER calculation with proper device handling
-        if params.att_rate == 0.0:
-            HLG = None
-            H = k2.ctc_topo(
-                max_token=max_token_id,
-                modified=False,
-                device=device,
-            )
-            bpe_model = spm.SentencePieceProcessor()
-            bpe_model.load(str(params.lang_dir / "bpe.model"))
-        else:
-            H = None
-            bpe_model = None
-            HLG = k2.Fsa.from_dict(
-                torch.load(f"{params.lang_dir}/HLG.pt", map_location=device)
-            )
-            assert HLG.requires_grad is False
-
-            if not hasattr(HLG, "lm_scores"):
-                HLG.lm_scores = HLG.scores.clone()
-        
-        # For BPE mode, create a simple word table from tokens
-        if "lang_bpe" in str(params.lang_dir):
-            # Read tokens and create a simple word table mapping
-            tokens_file = params.lang_dir / "tokens.txt"
-            if tokens_file.exists():
-                word_table = {}
-                with open(tokens_file, 'r') as f:
-                    for line in f:
-                        if line.strip():
-                            parts = line.strip().split()
-                            if len(parts) >= 2:
-                                token, idx = parts[0], parts[1]
-                                word_table[token] = int(idx)
-            else:
-                word_table = None
-        else:
-            # Phone mode: use lexicon word table
-            lexicon = Lexicon(params.lang_dir)
-            word_table = lexicon.word_table
-        
-
-        
-        # Use validation-specific decoding parameters
-        if params.validation_decoding_method == "greedy":
-            logging.info("Starting decode_dataset with GREEDY decoding...")
-            # Override beam parameters for greedy decoding
-            original_search_beam = params.search_beam
-            original_output_beam = params.output_beam
-            params.search_beam = 1.0  # Greedy = beam size 1
-            params.output_beam = 1.0
-        else:
-            logging.info(f"Starting decode_dataset with BEAM search (search_beam={params.validation_search_beam}, output_beam={params.validation_output_beam})...")
-            # Use validation-specific beam parameters
-            original_search_beam = params.search_beam
-            original_output_beam = params.output_beam
-            params.search_beam = params.validation_search_beam
-            params.output_beam = params.validation_output_beam
-        
         try:
-            results_dict = decode_dataset(
+            # Setup for decoding (similar to decode.py)
+            sos_id = graph_compiler.sos_id
+            eos_id = graph_compiler.eos_id
+            
+            # Read vocab size from tokens.txt
+            tokens_file = params.lang_dir / "tokens.txt"
+            with open(tokens_file, 'r', encoding='utf-8') as f:
+                vocab_size = len(f.readlines())
+            max_token_id = vocab_size - 1
+
+            # Setup decoding components (from decode.py pattern)
+            if params.att_rate == 0.0:
+                # CTC decoding mode
+                HLG = None
+                H = k2.ctc_topo(
+                    max_token=max_token_id,
+                    modified=False,
+                    device=device,
+                )
+                bpe_model = spm.SentencePieceProcessor()
+                bpe_model.load(str(params.lang_dir / "bpe.model"))
+            else:
+                # Attention decoding mode
+                H = None
+                bpe_model = None
+                HLG = k2.Fsa.from_dict(
+                    torch.load(f"{params.lang_dir}/HLG.pt", map_location=device)
+                )
+                assert HLG.requires_grad is False
+                if not hasattr(HLG, "lm_scores"):
+                    HLG.lm_scores = HLG.scores.clone()
+
+            # Create word table (from decode.py)
+            word_table = {}
+            with open(tokens_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            token, idx = parts[0], parts[1]
+                            word_table[int(idx)] = token
+
+            # Set validation-specific decoding parameters
+            original_search_beam = getattr(params, 'search_beam', 20.0)
+            original_output_beam = getattr(params, 'output_beam', 8.0)
+            
+            if params.validation_decoding_method == "greedy":
+                params.search_beam = 1.0
+                params.output_beam = 1.0
+            else:
+                params.search_beam = getattr(params, 'validation_search_beam', 10.0)
+                params.output_beam = getattr(params, 'validation_output_beam', 5.0)
+
+            # Decode validation set (using decode.py logic)
+            results_dict = _decode_validation_dataset(
                 dl=valid_dl,
                 params=params,
                 model=model,
-                rnn_lm_model=None,  # For CTC validation, we don't use RNN LM
                 HLG=HLG,
                 H=H,
                 bpe_model=bpe_model,
                 word_table=word_table,
                 sos_id=sos_id,
                 eos_id=eos_id,
+                device=device,
             )
             
-        except Exception as e:
-            logging.error(f"decode_dataset failed: {e}")
-            logging.error("Skipping WER computation for this validation")
+            # Compute WER and save results
+            wer_value = None
+            if results_dict:
+                # Use first decoding method for WER calculation
+                key = list(results_dict.keys())[0]
+                results = results_dict[key]
+                
+                total_errors = 0
+                total_words = 0
+                error_details = []  # Store detailed error information
+                
+                # Calculate WER and collect error details
+                for cut_id, ref_words, hyp_words in results:
+                    # Simple WER calculation
+                    ref_len = len(ref_words)
+                    hyp_len = len(hyp_words)
+                    
+                    # Calculate edit distance (simplified)
+                    errors = _calculate_edit_distance(ref_words, hyp_words)
+                    
+                    total_errors += errors
+                    total_words += ref_len
+                    
+                    # Store error details for this utterance
+                    utt_wer = (errors / ref_len * 100) if ref_len > 0 else 0.0
+                    error_details.append({
+                        'cut_id': cut_id,
+                        'ref': ref_words,
+                        'hyp': hyp_words,
+                        'errors': errors,
+                        'ref_len': ref_len,
+                        'wer': utt_wer
+                    })
+                
+                wer_value = (total_errors / total_words * 100) if total_words > 0 else 0.0
+                logging.info(f"Validation WER: {wer_value:.2f}% (Errors: {total_errors}, Words: {total_words})")
+                
+                # Save results to files (only rank 0)
+                if rank == 0:
+                    # Create file names
+                    recogs_filename = params.exp_dir / f"recogs-valid-{key}-epoch{epoch}-batch{params.batch_idx_train}.txt"
+                    errs_filename = params.exp_dir / f"errs-valid-{key}-epoch{epoch}-batch{params.batch_idx_train}.txt"
+                    wer_summary_file = params.exp_dir / f"wer-summary-epoch_{epoch}_validation.txt"
+                    
+                    # Save recognition results (ref and hyp pairs)
+                    with open(recogs_filename, "w") as f:
+                        for detail in error_details:
+                            ref_text = " ".join(detail['ref'])
+                            hyp_text = " ".join(detail['hyp'])
+                            f.write(f"ref {detail['cut_id']}: {ref_text}\n")
+                            f.write(f"hyp {detail['cut_id']}: {hyp_text}\n")
+                            f.write("\n")
+                    
+                    logging.info(f"Saved validation transcripts to {recogs_filename}")
+                    
+                    # Save error statistics (detailed per utterance)
+                    with open(errs_filename, "w") as f:
+                        f.write("CUT_ID\tREF_LEN\tHYP_LEN\tERRORS\tWER(%)\n")
+                        for detail in error_details:
+                            f.write(f"{detail['cut_id']}\t{detail['ref_len']}\t{len(detail['hyp'])}\t{detail['errors']}\t{detail['wer']:.2f}\n")
+                        f.write(f"\nOVERALL\t{total_words}\t-\t{total_errors}\t{wer_value:.2f}\n")
+                    
+                    logging.info(f"Saved error statistics to {errs_filename}")
+                    
+                    # Save WER summary
+                    with open(wer_summary_file, "w") as f:
+                        f.write("method\tWER\n")
+                        f.write(f"{key}\t{wer_value:.2f}\n")
+                    
+                    logging.info(f"Saved WER summary to {wer_summary_file}")
+            
             # Restore original beam parameters
-            if params.validation_decoding_method == "greedy":
-                params.search_beam = original_search_beam
-                params.output_beam = original_output_beam
-            else:
-                params.search_beam = original_search_beam
-                params.output_beam = original_output_beam
+            params.search_beam = original_search_beam
+            params.output_beam = original_output_beam
             
-            logging.info(f"Validation loss: {loss_value:.4f}")
-            return tot_loss, None
-        
-        # Restore original beam parameters
-        if params.validation_decoding_method == "greedy":
-            params.search_beam = original_search_beam
-            params.output_beam = original_output_beam
-        else:
-            params.search_beam = original_search_beam
-            params.output_beam = original_output_beam
-        
-        logging.info("Starting save_results...")
-        
-        try:
-            wer_results = save_results(params=params, test_set_name=f"epoch_{epoch}_validation", results_dict=results_dict)
+            return tot_loss, wer_value
+            
         except Exception as e:
-            logging.error(f"save_results failed: {e}")
-            logging.error("Skipping WER computation due to save_results error")
-            logging.info(f"Validation loss: {loss_value:.4f}")
+            logging.error(f"WER computation failed: {e}")
+            logging.error(f"Error type: {type(e).__name__}")
+            # Restore beam parameters even on error
+            if 'original_search_beam' in locals():
+                params.search_beam = original_search_beam
+                params.output_beam = original_output_beam
             return tot_loss, None
-        
-        # Log WER results
-        if wer_results:
-            for method, wer_value in wer_results.items():
-                logging.info(f"Dataset-level WER ({method}): {wer_value:.2f}% (total errors/total words)")
-                # Log each WER method to TensorBoard
-                if rank == 0 and tb_writer is not None:
-                    tb_writer.add_scalar(f"validation/wer_{method}", wer_value, params.batch_idx_train)
-        else:
-            logging.info("Validation WER: N/A")
-        
-        # Log some example predictions vs ground truth for inspection
-        log_prediction_examples(results_dict, max_examples=3)
-        
-        # Log examples to TensorBoard if available
-        if rank == 0 and tb_writer is not None:
-            log_validation_examples_to_tensorboard(results_dict, tb_writer, params.batch_idx_train, max_examples=5)
-        
-        # Calculate overall WER statistics if we have results
-        overall_wer = None
-        if wer_results:
-            # Find the main WER method (usually the first one or the one with 'wer' in the name)
-            main_wer_key = None
-            for key in wer_results.keys():
-                if 'wer' in key.lower() or 'word_error_rate' in key.lower():
-                    main_wer_key = key
-                    break
-            
-            if main_wer_key is None and wer_results:
-                # If no specific WER key found, use the first one
-                main_wer_key = list(wer_results.keys())[0]
-            
-            if main_wer_key:
-                overall_wer = wer_results[main_wer_key]
-                logging.info(f"Main dataset-level WER ({main_wer_key}): {overall_wer:.2f}% (total errors/total words)")
-                # Log the main/total WER to TensorBoard
-                if rank == 0 and tb_writer is not None:
-                    tb_writer.add_scalar("validation/total_wer", overall_wer, params.batch_idx_train)
-                    tb_writer.add_scalar("validation/wer_dataset_level", overall_wer, params.batch_idx_train)
-        
-        # Final logging of validation results
-        logging.info(f"Validation loss: {loss_value:.4f}")
-        if overall_wer is not None:
-            logging.info(f"Total validation WER: {overall_wer:.2f}% (dataset-level)")
-            # Log the final total WER to TensorBoard
-            if rank == 0 and tb_writer is not None:
-                tb_writer.add_scalar("validation/loss", loss_value, params.batch_idx_train)
-                tb_writer.add_scalar("validation/total_wer", overall_wer, params.batch_idx_train)
-        else:
-            logging.info("Validation WER: N/A")
 
-        return tot_loss, overall_wer
+
+def _decode_validation_dataset(
+    dl: torch.utils.data.DataLoader,
+    params: AttributeDict,
+    model: nn.Module,
+    HLG: Optional[k2.Fsa],
+    H: Optional[k2.Fsa],
+    bpe_model: Optional[spm.SentencePieceProcessor],
+    word_table: dict,
+    sos_id: int,
+    eos_id: int,
+    device: torch.device,
+    max_batches: int = 10,  # Limit batches for validation
+) -> Dict[str, List[Tuple[str, List[str], List[str]]]]:
+    """
+    Decode validation dataset (simplified version of decode.py's decode_dataset).
+    Limited to max_batches for efficiency during training.
+    """
+    from collections import defaultdict
+    from icefall.decode import get_lattice, one_best_decoding
+    from icefall.utils import get_texts
+    
+    results = defaultdict(list)
+    
+    for batch_idx, batch in enumerate(dl):
+        if batch_idx >= max_batches:
+            break
+            
+        try:
+            texts = batch["supervisions"]["text"]
+            cut_ids = [cut.id for cut in batch["supervisions"]["cut"]]
+            
+            hyps_dict = _decode_one_validation_batch(
+                params=params,
+                model=model,
+                HLG=HLG,
+                H=H,
+                bpe_model=bpe_model,
+                batch=batch,
+                word_table=word_table,
+                sos_id=sos_id,
+                eos_id=eos_id,
+                device=device,
+            )
+            
+            if hyps_dict is not None:
+                for lm_scale, hyps in hyps_dict.items():
+                    this_batch = []
+                    for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
+                        ref_words = ref_text.split()
+                        this_batch.append((cut_id, ref_words, hyp_words))
+                    results[lm_scale].extend(this_batch)
+                    
+        except Exception as e:
+            logging.warning(f"Failed to decode validation batch {batch_idx}: {e}")
+            continue
+    
+    return results
+
+
+def _decode_one_validation_batch(
+    params: AttributeDict,
+    model: nn.Module,
+    HLG: Optional[k2.Fsa],
+    H: Optional[k2.Fsa],
+    bpe_model: Optional[spm.SentencePieceProcessor],
+    batch: dict,
+    word_table: dict,
+    sos_id: int,
+    eos_id: int,
+    device: torch.device,
+) -> Optional[Dict[str, List[List[str]]]]:
+    """
+    Decode one validation batch (simplified version of decode.py's decode_one_batch).
+    """
+    try:
+        from icefall.decode import get_lattice, one_best_decoding
+        from icefall.utils import get_texts
+        
+        feature = batch["inputs"].to(device)
+        supervisions = batch["supervisions"]
+        
+        # Model forward pass
+        nnet_output, memory, memory_key_padding_mask, _, _ = model(feature, None)
+        
+        # Prepare supervision segments
+        supervision_segments = torch.stack(
+            (
+                supervisions["sequence_idx"],
+                supervisions["start_frame"] // params.subsampling_factor,
+                supervisions["num_frames"] // params.subsampling_factor,
+            ),
+            1,
+        ).to(torch.int32)
+        
+        # Clamp supervision segments
+        max_allowed_frames = nnet_output.size(1)
+        supervision_segments[:, 2] = torch.clamp(supervision_segments[:, 2], max=max_allowed_frames)
+        supervision_segments = supervision_segments.cpu()
+        
+        # Select decoding graph
+        if H is None:
+            decoding_graph = HLG
+        else:
+            decoding_graph = H
+        
+        # Get lattice
+        lattice = get_lattice(
+            nnet_output=nnet_output,
+            decoding_graph=decoding_graph,
+            supervision_segments=supervision_segments,
+            search_beam=params.search_beam,
+            output_beam=params.output_beam,
+            min_active_states=getattr(params, 'min_active_states', 30),
+            max_active_states=getattr(params, 'max_active_states', 1000),
+            subsampling_factor=params.subsampling_factor,
+        )
+        
+        # CTC decoding (simplified)
+        best_path = one_best_decoding(
+            lattice=lattice, 
+            use_double_scores=getattr(params, 'use_double_scores', True)
+        )
+        
+        if params.att_rate == 0.0 and bpe_model is not None:
+            # CTC decoding with BPE
+            token_ids = get_texts(best_path)
+            hyps = bpe_model.decode(token_ids)
+            hyps = [s.split() for s in hyps]
+        else:
+            # Standard decoding
+            hyps = get_texts(best_path)
+            hyps = [[word_table.get(i, f"<UNK{i}>") for i in ids] for ids in hyps]
+        
+        return {"validation": hyps}
+        
+    except Exception as e:
+        logging.warning(f"Batch decoding failed: {e}")
+        return None
+
+
+def _calculate_edit_distance(ref_words: List[str], hyp_words: List[str]) -> int:
+    """
+    Calculate simple edit distance (Levenshtein distance).
+    """
+    m, n = len(ref_words), len(hyp_words)
+    
+    # Create DP table
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    
+    # Initialize base cases
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    
+    # Fill DP table
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if ref_words[i-1] == hyp_words[j-1]:
+                dp[i][j] = dp[i-1][j-1]
+            else:
+                dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+    
+    return dp[m][n]
+
+
+def log_prediction_examples(results_dict, max_examples=5, force_log=False):
+    """
+    Log a few examples of ground truth vs predicted text for validation inspection.
+    Only logs to terminal every 50 validation samples to reduce clutter.
+    
+    Args:
+        results_dict: Dictionary containing decoding results
+        max_examples: Maximum number of examples to log
+        force_log: Force logging regardless of sample counter
+    """
+    
+    if not results_dict:
+        return
+    
+    # Get the first method's results (usually there's only one method in validation)
+    first_method = list(results_dict.keys())[0]
+    results = results_dict[first_method]
+    
+    if not results:
+        return
+    
+    
+    # Still compute and log basic statistics, just not the detailed examples
+    total_sample_wer = 0
+    valid_samples = 0
+    
+    for result in results:
+        if len(result) >= 3:
+            cut_id, ref_words, hyp_words = result[0], result[1], result[2]
+            ref_text = " ".join(ref_words) if isinstance(ref_words, list) else str(ref_words)
+            hyp_text = " ".join(hyp_words) if isinstance(hyp_words, list) else str(hyp_words)
+            
+            ref_word_list = ref_text.split()
+            hyp_word_list = hyp_text.split()
+            
+            if len(ref_word_list) > 0:
+                import difflib
+                matcher = difflib.SequenceMatcher(None, ref_word_list, hyp_word_list)
+                word_errors = len(ref_word_list) + len(hyp_word_list) - 2 * sum(triple.size for triple in matcher.get_matching_blocks())
+                utt_wer = (word_errors / len(ref_word_list)) * 100
+                total_sample_wer += utt_wer
+                valid_samples += 1
+    
+
+    # Select diverse examples: some short, some long, some with errors, some perfect
+    selected_examples = []
+    
+    # Try to get diverse examples by length and error type
+    perfect_matches = []
+    error_cases = []
+    
+    for result in results:
+        if len(result) >= 3:
+            cut_id, ref_words, hyp_words = result[0], result[1], result[2]
+            ref_text = " ".join(ref_words) if isinstance(ref_words, list) else str(ref_words)
+            hyp_text = " ".join(hyp_words) if isinstance(hyp_words, list) else str(hyp_words)
+            
+            if ref_text.split() == hyp_text.split():
+                perfect_matches.append(result)
+            else:
+                error_cases.append(result)
+    
+    # Mix perfect matches and error cases
+    selected_examples = error_cases[:max_examples-1] + perfect_matches[:1]
+    if len(selected_examples) < max_examples:
+        selected_examples.extend(results[:max_examples - len(selected_examples)])
+    
+    selected_examples = selected_examples[:max_examples]
+    
+    logging.info("=" * 80)
+    logging.info(f"VALIDATION EXAMPLES (showing {len(selected_examples)} samples):")
+    logging.info("=" * 80)
+    
+    total_sample_wer = 0
+    valid_samples = 0
+    
+    for i, result in enumerate(selected_examples):
+        if len(result) >= 3:
+            cut_id, ref_words, hyp_words = result[0], result[1], result[2]
+            
+            # Convert word lists to strings
+            ref_text = " ".join(ref_words) if isinstance(ref_words, list) else str(ref_words)
+            hyp_text = " ".join(hyp_words) if isinstance(hyp_words, list) else str(hyp_words)
+            
+            logging.info(f"Example {i+1} (ID: {cut_id}):")
+            logging.info(f"  REF: {ref_text}")
+            logging.info(f"  HYP: {hyp_text}")
+            
+            # Simple word error analysis
+            ref_word_list = ref_text.split()
+            hyp_word_list = hyp_text.split()
+            
+            if ref_word_list == hyp_word_list:
+                logging.info(f"  --> ✅ PERFECT MATCH ({len(ref_word_list)} words, WER: 0.0%)")
+                total_sample_wer += 0.0
+                valid_samples += 1
+            else:
+                # Basic error analysis
+                ref_len = len(ref_word_list)
+                hyp_len = len(hyp_word_list)
+                
+                # Calculate simple WER for this utterance
+                import difflib
+                matcher = difflib.SequenceMatcher(None, ref_word_list, hyp_word_list)
+                word_errors = ref_len + hyp_len - 2 * sum(triple.size for triple in matcher.get_matching_blocks())
+                utt_wer = (word_errors / ref_len * 100) if ref_len > 0 else 0
+                total_sample_wer += utt_wer
+                valid_samples += 1
+                
+                # Find common words for basic analysis
+                ref_set = set(ref_word_list)
+                hyp_set = set(hyp_word_list)
+                missing_words = ref_set - hyp_set
+                extra_words = hyp_set - ref_set
+                
+                error_info = f"WER: {utt_wer:.1f}%, REF: {ref_len} words, HYP: {hyp_len} words"
+                if missing_words and len(missing_words) <= 3:
+                    error_info += f", Missing: {list(missing_words)}"
+                elif missing_words:
+                    error_info += f", Missing: {len(missing_words)} words"
+                    
+                if extra_words and len(extra_words) <= 3:
+                    error_info += f", Extra: {list(extra_words)}"
+                elif extra_words:
+                    error_info += f", Extra: {len(extra_words)} words"
+                
+                logging.info(f"  --> ❌ ERRORS ({error_info})")
+            logging.info("")
+    
+    # Log average WER for the examples
+    if valid_samples > 0:
+        avg_example_wer = total_sample_wer / valid_samples
+        logging.info(f"Average WER for these {valid_samples} examples: {avg_example_wer:.2f}%")
+    
+    logging.info("=" * 80)
+
+
+def log_validation_examples_to_tensorboard(results_dict, tb_writer, step, max_examples=5):
+    """
+    Log validation examples to TensorBoard as text.
+    
+    Args:
+        results_dict: Dictionary containing decoding results
+        tb_writer: TensorBoard writer
+        step: Current training step
+        max_examples: Maximum number of examples to log
+    """
+    if not results_dict or tb_writer is None:
+        return
+    
+    # Get the first method's results
+    first_method = list(results_dict.keys())[0]
+    results = results_dict[first_method]
+    
+    if not results:
+        return
+    
+    # Select diverse examples
+    selected_examples = []
+    perfect_matches = []
+    error_cases = []
+    
+    for result in results:
+        if len(result) >= 3:
+            cut_id, ref_words, hyp_words = result[0], result[1], result[2]
+            ref_text = " ".join(ref_words) if isinstance(ref_words, list) else str(ref_words)
+            hyp_text = " ".join(hyp_words) if isinstance(hyp_words, list) else str(hyp_words)
+            
+            if ref_text.split() == hyp_text.split():
+                perfect_matches.append(result)
+            else:
+                error_cases.append(result)
+    
+    # Mix error cases and perfect matches
+    selected_examples = error_cases[:max_examples-1] + perfect_matches[:1]
+    if len(selected_examples) < max_examples:
+        selected_examples.extend(results[:max_examples - len(selected_examples)])
+    
+    selected_examples = selected_examples[:max_examples]
+    
+    # Create text to log to TensorBoard
+    tb_text = "## Validation Examples\n\n"
+    
+    total_wer = 0
+    valid_count = 0
+    
+    for i, result in enumerate(selected_examples):
+        if len(result) >= 3:
+            cut_id, ref_words, hyp_words = result[0], result[1], result[2]
+            
+            ref_text = " ".join(ref_words) if isinstance(ref_words, list) else str(ref_words)
+            hyp_text = " ".join(hyp_words) if isinstance(hyp_words, list) else str(hyp_words)
+            
+            tb_text += f"**Example {i+1} (ID: {cut_id})**\n\n"
+            tb_text += f"- **REF:** {ref_text}\n"
+            tb_text += f"- **HYP:** {hyp_text}\n"
+            
+            # Calculate simple WER for this utterance
+            ref_word_list = ref_text.split()
+            hyp_word_list = hyp_text.split()
+            
+            if ref_word_list == hyp_word_list:
+                tb_text += f"- **Result:** ✅ PERFECT MATCH ({len(ref_word_list)} words, WER: 0.0%)\n\n"
+                total_wer += 0.0
+                valid_count += 1
+            else:
+                import difflib
+                matcher = difflib.SequenceMatcher(None, ref_word_list, hyp_word_list)
+                word_errors = len(ref_word_list) + len(hyp_word_list) - 2 * sum(triple.size for triple in matcher.get_matching_blocks())
+                utt_wer = (word_errors / len(ref_word_list) * 100) if len(ref_word_list) > 0 else 0
+                tb_text += f"- **Result:** ❌ WER: {utt_wer:.1f}% (REF: {len(ref_word_list)} words, HYP: {len(hyp_word_list)} words)\n\n"
+                total_wer += utt_wer
+                valid_count += 1
+    
+    # Add summary statistics
+    if valid_count > 0:
+        avg_wer = total_wer / valid_count
+        tb_text += f"**Summary:** Average WER for {valid_count} examples: {avg_wer:.2f}%\n\n"
+    
+    # Log to TensorBoard
+    tb_writer.add_text("Validation/Examples", tb_text, step)
 
 
 def train_one_epoch(
@@ -1422,18 +1993,33 @@ def train_one_epoch(
                 logging.info(f"EMA teacher updated at step {params.batch_idx_train}")
 
         if batch_idx % params.log_interval == 0:
+            # Get current learning rate
+            if params.scheduler_type == "noam" and hasattr(optimizer, '_rate'):
+                cur_lr = optimizer._rate
+            else:
+                cur_lr = optimizer.param_groups[0]['lr']
+            
             logging.info(
                 f"Epoch {params.cur_epoch}, "
                 f"batch {batch_idx}, loss[{loss_info}], "
-                f"tot_loss[{tot_loss}], batch size: {batch_size}"
+                f"tot_loss[{tot_loss}], batch size: {batch_size}, "
+                f"lr: {cur_lr:.2e}"
             )
 
         if batch_idx % params.log_interval == 0:
+            # Get current learning rate for TensorBoard
+            if params.scheduler_type == "noam" and hasattr(optimizer, '_rate'):
+                cur_lr = optimizer._rate
+            else:
+                cur_lr = optimizer.param_groups[0]['lr']
+                
             if tb_writer is not None:
                 loss_info.write_summary(
                     tb_writer, "train/current_", params.batch_idx_train
                 )
                 tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
+                # Add learning rate to TensorBoard
+                tb_writer.add_scalar("train/learning_rate", cur_lr, params.batch_idx_train)
 
         if batch_idx > 0 and batch_idx % params.valid_interval == 0 and params.enable_validation:
             logging.info(f"Computing validation loss (rank {rank})")
@@ -1858,15 +2444,16 @@ def run(rank, world_size, args):
         ema_teacher=ema_teacher
     )
     
-    # Load optimizer state from checkpoint if available
-    if checkpoints and "optimizer" in checkpoints: 
-        try:
-            optimizer.load_state_dict(checkpoints["optimizer"])
-            logging.info("Successfully loaded optimizer state from checkpoint")
-        except (ValueError, KeyError, RuntimeError) as e:
-            logging.warning(f"Failed to load optimizer state: {e}")
-            logging.warning("Starting with fresh optimizer state")
-            # Continue training with fresh optimizer state
+    # For fine-tuning, we DO NOT load the optimizer state.
+    # The optimizer is created fresh.
+    # if checkpoints and "optimizer" in checkpoints: 
+    #     try:
+    #         optimizer.load_state_dict(checkpoints["optimizer"])
+    #         logging.info("Successfully loaded optimizer state from checkpoint")
+    #     except (ValueError, KeyError, RuntimeError) as e:
+    #         logging.warning(f"Failed to load optimizer state: {e}")
+    #         logging.warning("Starting with fresh optimizer state")
+    #         # Continue training with fresh optimizer state
     
     # Initialize prototype manager for KL-based distillation
     # Memory optimization: Skip prototype manager for ASR-only mode
@@ -1960,6 +2547,37 @@ def run(rank, world_size, args):
     for epoch in range(params.start_epoch, params.num_epochs):
         fix_random_seed(params.seed + epoch)
         train_dl.sampler.set_epoch(epoch)
+
+        # Re-cluster prototypes at specified intervals
+        if (
+            prototype_manager is not None
+            and params.recluster_prototypes_interval > 0
+            and epoch >= params.recluster_start_epoch
+            and (epoch - params.recluster_start_epoch) % params.recluster_prototypes_interval == 0
+            and epoch > params.start_epoch  # Don't recluster on the very first epoch we're resuming from
+        ):
+            if rank == 0:
+                logging.info(f"=" * 60)
+                logging.info(f"Re-clustering prototypes at epoch {epoch}")
+                logging.info(f"  - Interval: every {params.recluster_prototypes_interval} epochs")
+                logging.info(f"  - Started from: epoch {params.recluster_start_epoch}")
+                logging.info(f"=" * 60)
+            
+            # Re-initialize prototypes using K-means on fresh feature samples
+            start_time = time.time()
+            prototype_manager.initialize_prototypes(
+                model=model,
+                train_dl=train_dl,
+                num_samples=params.prototype_samples,
+                device=device,
+                rank=rank,
+                world_size=world_size,
+            )
+            
+            if rank == 0:
+                elapsed = time.time() - start_time
+                logging.info(f"Prototype re-clustering completed in {elapsed:.2f} seconds")
+                logging.info(f"=" * 60)
 
         # Get current learning rate based on optimizer type
         if params.scheduler_type == "noam" and hasattr(optimizer, '_rate'):

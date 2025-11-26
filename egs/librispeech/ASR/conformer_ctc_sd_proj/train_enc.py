@@ -45,7 +45,6 @@ from asr_datamodule import LibriSpeechAsrDataModule, LibriLightAsrDataModule
 from conformer import Conformer
 from ema_teacher import EMATeacher
 from k_means_clustering import PrototypeKMeansManager
-from k_means_clustering import PrototypeKMeansManager
 from lhotse.cut import Cut
 from lhotse.utils import fix_random_seed
 from torch import Tensor
@@ -249,9 +248,9 @@ def get_parser():
         "--distill-layers",
         type=str,
         default="6",
-        help="Which encoder layer(s) to use for distillation (0-based). "
-             "Can be a single layer (e.g., '6') or comma-separated list (e.g., '4,6,8'). "
-             "Clean and noisy outputs from these layers will be compared.",
+        help="Which encoder layer(s) to use for distillation (1-based layer numbers). "
+             "Can be a single layer (e.g., '6') or comma-separated list (e.g., '5,12,18'). "
+             "Example: '6' uses the 6th layer, '5,12,18' uses 5th, 12th, and 18th layers.",
     )
     
     parser.add_argument(
@@ -602,10 +601,19 @@ def load_checkpoint_if_available(
 
     # Try to load EMA teacher checkpoint if it exists
     if ema_teacher is not None:
+        ema_filename = None
+        
         if resume_path:
             # If resume_path was used, try to find EMA checkpoint next to it
             resume_file = Path(resume_path)
+            
+            # Try multiple naming patterns for flexibility
+            # 1. Match exact pattern: step-X-suffix-ema-teacher.pt
             ema_filename = resume_file.parent / f"{resume_file.stem}-ema-teacher.pt"
+            
+            # 2. If not found and it's a best checkpoint, try that pattern
+            if not ema_filename.exists() and "best-" in resume_file.stem:
+                ema_filename = resume_file.parent / f"{resume_file.stem}-ema-teacher.pt"
         else:
             # Standard epoch-based EMA checkpoint naming
             ema_filename = models_dir / f"epoch-{params.start_epoch-1}-ema-teacher.pt"
@@ -618,12 +626,22 @@ def load_checkpoint_if_available(
             try:
                 ema_state_dict = torch.load(ema_filename, map_location='cpu')
                 ema_teacher.load_state_dict(ema_state_dict)
-                logging.info(f"Loaded EMA teacher checkpoint from {ema_filename}")
+                logging.info(f"✓ Loaded EMA teacher checkpoint from {ema_filename}")
+                
+                # Verify that teacher model has different parameters than student
+                teacher_params = list(ema_teacher.teacher_model.parameters())
+                student_params = list(model.parameters())
+                if len(teacher_params) > 0 and len(student_params) > 0:
+                    param_diff = (teacher_params[0].data - student_params[0].data).abs().mean().item()
+                    logging.info(f"  EMA teacher vs student param diff: {param_diff:.8f}")
+                
                 saved_params['ema_teacher'] = ema_state_dict
             except Exception as e:
                 logging.warning(f"Failed to load EMA teacher checkpoint: {e}")
+                logging.warning("Will initialize EMA teacher from current student model")
         else:
-            logging.info("EMA teacher checkpoint not found, will initialize from student model")
+            logging.info(f"EMA teacher checkpoint not found at {ema_filename}")
+            logging.info("Will initialize EMA teacher from current student model")
 
     return saved_params
 
@@ -681,17 +699,42 @@ def save_checkpoint(
     
     # Save EMA teacher model separately if it exists
     if ema_teacher is not None:
-        ema_filename = models_dir / f"epoch-{params.cur_epoch}-ema-teacher.pt"
+        # Use consistent naming: match the main checkpoint's naming scheme
+        if suffix:
+            # For validation checkpoints with suffix, use step-based naming
+            epoch_or_step = step if step is not None else params.cur_epoch
+            if wer_value is not None:
+                ema_filename = models_dir / f"step-{epoch_or_step}-{suffix}-wer{wer_value:.2f}-epoch{epoch}-ema-teacher.pt"
+            else:
+                ema_filename = models_dir / f"step-{epoch_or_step}-{suffix}-ema-teacher.pt"
+        else:
+            # For regular epoch checkpoints
+            ema_filename = models_dir / f"epoch-{params.cur_epoch}-ema-teacher.pt"
+        
         torch.save(ema_teacher.state_dict(), ema_filename)
         logging.info(f"EMA teacher checkpoint saved to {ema_filename}")
 
     if params.best_train_epoch == params.cur_epoch:
         best_train_filename = models_dir / "best-train-loss.pt"
         copyfile(src=filename, dst=best_train_filename)
+        # Also copy EMA teacher checkpoint
+        if ema_teacher is not None:
+            best_train_ema_filename = models_dir / "best-train-loss-ema-teacher.pt"
+            ema_source = models_dir / f"epoch-{params.cur_epoch}-ema-teacher.pt"
+            if ema_source.exists():
+                copyfile(src=ema_source, dst=best_train_ema_filename)
+                logging.info(f"Best train EMA teacher checkpoint saved to {best_train_ema_filename}")
 
     if params.best_valid_epoch == params.cur_epoch:
         best_valid_filename = models_dir / "best-valid-loss.pt"
         copyfile(src=filename, dst=best_valid_filename)
+        # Also copy EMA teacher checkpoint
+        if ema_teacher is not None:
+            best_valid_ema_filename = models_dir / "best-valid-loss-ema-teacher.pt"
+            ema_source = models_dir / f"epoch-{params.cur_epoch}-ema-teacher.pt"
+            if ema_source.exists():
+                copyfile(src=ema_source, dst=best_valid_ema_filename)
+                logging.info(f"Best valid EMA teacher checkpoint saved to {best_valid_ema_filename}")
     
     logging.info(f"Checkpoint saved successfully to {filename}")
     # Remove the print statement that might be causing issues
@@ -740,6 +783,14 @@ def compute_loss(
         
         clean_feature = None
         noisy_feature = None
+    else:
+        # encoder-only or hybrid mode but batch doesn't have clean/noisy structure
+        # This can happen if dataloader doesn't provide clean/noisy pairs
+        feature = batch["inputs"]
+        clean_feature = None
+        noisy_feature = None
+        logging.warning(f"learning_type={params.learning_type} but batch doesn't contain 'clean'/'noisy' keys. "
+                       "Using single feature without self-distillation.")
     
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
@@ -769,7 +820,11 @@ def compute_loss(
         logging.debug(f"SSL batch_size={batch_size}, seq_len={seq_len}, encoder_memory shape: {encoder_memory.shape}")
         
         # Self-distillation computation
-        distillation_loss = torch.tensor(0.0, device=model_device)
+        # Initialize with requires_grad=True for encoder-only mode
+        if params.learning_type == "encoder-only":
+            distillation_loss = torch.tensor(0.0, device=model_device, requires_grad=True)
+        else:
+            distillation_loss = torch.tensor(0.0, device=model_device)
         
         
         if params.learning_type in ["encoder-only", "hybrid"] and clean_feature is not None:
@@ -813,6 +868,14 @@ def compute_loss(
                 # Get student projected outputs
                 student_projected_outputs = model.get_intermediate_outputs(feature, None)
                 
+                # Debug: Check what was returned
+                if params.batch_idx_train % 100 == 0:
+                    logging.info(f"Debug projected outputs - teacher: {type(teacher_projected_outputs)}, "
+                                f"teacher len: {len(teacher_projected_outputs) if teacher_projected_outputs else 'None'}, "
+                                f"student: {type(student_projected_outputs)}, "
+                                f"student len: {len(student_projected_outputs) if student_projected_outputs else 'None'}, "
+                                f"distill_layers: {distill_layers}")
+                
                 if teacher_projected_outputs and student_projected_outputs:
                     from conformer import compute_multi_layer_distillation_loss
                     
@@ -842,7 +905,11 @@ def compute_loss(
                     )
                 else:
                     logging.warning("Failed to get projected outputs for distillation")
-                    distillation_loss = torch.tensor(0.0, device=model_device)
+                    # Keep requires_grad=True for encoder-only mode
+                    if params.learning_type == "encoder-only":
+                        distillation_loss = torch.tensor(0.0, device=model_device, requires_grad=True)
+                    else:
+                        distillation_loss = torch.tensor(0.0, device=model_device)
                 
 
         else:
@@ -850,6 +917,9 @@ def compute_loss(
                 logging.debug("Self-distillation disabled (learning-type=asr)")
             elif clean_feature is None:
                 logging.warning("Clean feature is None, skipping self-distillation")
+                # Keep requires_grad=True for encoder-only mode even when clean_feature is None
+                if params.learning_type == "encoder-only":
+                    distillation_loss = torch.tensor(0.0, device=model_device, requires_grad=True)
 
 
     # Add self-distillation loss with proper scale matching
@@ -863,6 +933,11 @@ def compute_loss(
                         f"distill_loss={distillation_loss:.6f}, "
                         f"alpha={params.alpha}, "
                         f"final_loss={total_loss:.6f}")
+    else:
+        # For other modes (asr, hybrid), initialize total_loss
+        # This should not happen in encoder-only training script, but add for safety
+        total_loss = torch.tensor(0.0, device=model_device, requires_grad=is_training)
+        logging.error(f"Unexpected learning_type in encoder-only training: {params.learning_type}")
         
     assert total_loss.requires_grad == is_training
 
@@ -932,16 +1007,20 @@ def compute_validation_loss(
         # Always compute WER for analysis
         logging.info("Starting WER computation...")
         
-        # Use the existing graph_compiler instead of creating a new one
-        # to ensure device compatibility in DDP training
-        sos_id = graph_compiler.sos_id
-        eos_id = graph_compiler.eos_id
-        
         # Read vocab size from tokens.txt
         tokens_file = params.lang_dir / "tokens.txt"
         with open(tokens_file, 'r', encoding='utf-8') as f:
             vocab_size = len(f.readlines())
         max_token_id = vocab_size - 1
+        
+        # Get sos_id and eos_id - for CTC mode, these might not exist in graph_compiler
+        if hasattr(graph_compiler, 'sos_id'):
+            sos_id = graph_compiler.sos_id
+            eos_id = graph_compiler.eos_id
+        else:
+            # For CTC mode, use blank (0) as sos/eos (won't be used in decoding anyway)
+            sos_id = 0
+            eos_id = 0
 
         # WER calculation with proper device handling
         if params.att_rate == 0.0:
@@ -1231,6 +1310,25 @@ def train_one_epoch(
             if params.batch_idx_train % 1000 == 0:  # Log every 1000 steps instead of 100
                 logging.info(f"EMA teacher updated at step {params.batch_idx_train}")
 
+        # Save checkpoint every 1000 batches (only rank 0)
+        if params.batch_idx_train % 1000 == 0 and rank == 0:
+            logging.info(f"Saving periodic checkpoint at batch {params.batch_idx_train}")
+            try:
+                save_checkpoint(
+                    params=params,
+                    model=model,
+                    optimizer=optimizer,
+                    rank=rank,
+                    suffix=f"batch-{params.batch_idx_train}",
+                    wer_value=None,
+                    step=params.batch_idx_train,
+                    epoch=params.cur_epoch
+                )
+                logging.info(f"Periodic checkpoint saved successfully at batch {params.batch_idx_train}")
+            except Exception as e:
+                logging.error(f"Failed to save periodic checkpoint: {e}")
+                # Continue training even if checkpoint saving fails
+
         if batch_idx % params.log_interval == 0:
             logging.info(
                 f"Epoch {params.cur_epoch}, "
@@ -1385,7 +1483,7 @@ def run(rank, world_size, args):
     if isinstance(distill_layers, str):
         distill_layers = [int(x) for x in distill_layers.split(',') if x.strip()]
     
-    logging.info(f"Model creation parameters: distill_layers={distill_layers}")
+    logging.info(f"Model creation parameters: distill_layers={distill_layers}, learning_type={params.learning_type}")
 
     model = Conformer(
         num_features=params.feature_dim,
@@ -1396,7 +1494,8 @@ def run(rank, world_size, args):
         use_feat_batchnorm=params.use_feat_batchnorm,
         use_proj_layer=params.use_proj_layer,
         distill_layers=distill_layers,
-        proj_dim=128,  # Match PCA output dimension for prototypes
+        proj_dim=256,  # Match PCA output dimension for prototypes
+        learning_type=params.learning_type,  # Pass learning_type to model
     )
     model.to(device)
 
@@ -1662,7 +1761,7 @@ def run(rank, world_size, args):
             prototype_manager = PrototypeKMeansManager(
                 target_layers=distill_layers,
                 num_prototypes=params.num_prototypes,
-                proj_dim=128,  # Match PCA output dimension for prototypes
+                proj_dim=256,  # Match PCA output dimension for prototypes
                 temperature=params.distill_temperature,
                 save_dir=params.prototype_dir
             )
