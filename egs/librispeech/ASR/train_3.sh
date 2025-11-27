@@ -10,7 +10,7 @@ set -euo pipefail
 
 # Training parameters
 world_size=1 
-max_duration=300
+max_duration=320
 valid_max_duration=15         
 num_buckets=300               
 num_workers=6    
@@ -25,7 +25,7 @@ num_decoder_layers=0          # 0 for pure CTC
 start_epoch=0
 master_port=12346
 sanity_check=false           # Set to true for OOM checking (slower)
-resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/exp_1125/exp_4,8,12/models/averaged_10-20000.pt
+resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/exp_1126/3layer/exp_6,12,18/models/averaged_10-20000.pt
 enable_validation=true       # Temporarily disable validation to avoid crashes
 valid_interval=10000           # Much larger interval if we enable validation later
 
@@ -46,14 +46,15 @@ validation_skip_wer=false              # Skip WER computation for even faster va
 
 # Distillation Hyperparameters
 enable_self_distillation=False
-distill_layers=5,11,17
+distill_layers=6,12,18
+layer_weights=1.0,1.0,1.0
 distill_loss_type="kl"         # mse, cosine, kl
 alpha=1000
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 distill_temperature=4.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_proj/finetuning/exp_1125/exp_4,8,12
+exp_dir=conformer_ctc_sd_proj/finetuning/hybrid/layer_weights/exp_1.0-1.0-1.0
 
 
 # Data Augmentation Controls (modify these as needed)
@@ -89,13 +90,18 @@ noisy_spec_aug_frames_mask_size=100             # default: 100
 noisy_musan_ratio=0.5                           # default: 0.5
 noisy_snr_range=10,20
 noisy_rir_prob=0.5
-return_cuts=False
-on_the_fly_feats=false
+
 #
-use_proj_layer=False
-return_cuts=True
-on_the_fly_feats=False
+use_proj_layer=true
+return_cuts=true
+on_the_fly_feats=false
 learning_type="hybrid"
+clean_ratio=0.1
+dataset_type="auto"
+prototype_dir="./prototypes/librilight-512"
+num_prototypes=512
+prototype_samples=100000
+
 
 if [ -z "${PYTHONPATH:-}" ]; then
     export PYTHONPATH="/tmp/icefall"

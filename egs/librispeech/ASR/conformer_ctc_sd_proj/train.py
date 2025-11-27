@@ -252,8 +252,9 @@ def get_parser():
         "--distill-layers",
         type=str,
         default="6",
-        help="Which encoder layer(s) to use for distillation (0-based). "
-             "Can be a single layer (e.g., '6') or comma-separated list (e.g., '4,6,8'). "
+        help="Which encoder layer(s) to use for distillation (1-based). "
+             "Can be a single layer (e.g., '6') or comma-separated list (e.g., '6,12,18'). "
+             "For 18-layer encoder: use 1 for first layer, 18 for last layer. "
              "Clean and noisy outputs from these layers will be compared.",
     )
     
@@ -2194,7 +2195,7 @@ def run(rank, world_size, args):
         use_feat_batchnorm=params.use_feat_batchnorm,
         use_proj_layer=params.use_proj_layer,
         distill_layers=distill_layers,
-        proj_dim=128,  # Compressed dimension for prototype-based distillation
+        proj_dim=256,  # Compressed dimension for prototype-based distillation
         learning_type=params.learning_type,  # Memory optimization parameter
     )
     model.to(device)
