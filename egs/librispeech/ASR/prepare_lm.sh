@@ -2,10 +2,11 @@
 
 # fix segmentation fault reported in https://github.com/k2-fsa/icefall/issues/674
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
-
+vocab_sizes=(1024)
+dl_dir=/home/nas3/DB/Librispeech/raw
 set -eou pipefail
 
-# This script generate Ngram LM / NNLM and related files that needed by decoding.
+# This script generates Ngram LM / NNLM and related files needed by decoding.
 
 # We assume dl_dir (download dir) contains the following
 # directories and files. If not, they will be downloaded
@@ -24,11 +25,21 @@ set -eou pipefail
 #        - librispeech-lm-norm.txt.gz
 #
 
-. prepare.sh --stage -1 --stop-stage 6 || exit 1
-
+# . prepare.sh --stage -1 --stop-stage 6 || exit 1
+log() {
+  local fname=${BASH_SOURCE[1]##*/}
+  echo -e "$(date '+%Y-%m-%d %H:%M:%S') (${fname}:${BASH_LINENO[0]}:${FUNCNAME[1]}) $*"
+}
 log "Running prepare_lm.sh"
 
-stage=0
+
+if [ -z "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="/tmp/icefall"
+else
+    export PYTHONPATH="${PYTHONPATH}:/tmp/icefall"
+fi
+
+stage=6
 stop_stage=100
 
 . shared/parse_options.sh || exit 1
@@ -156,13 +167,13 @@ if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
           -lm $lang_dir/${ngram}gram.arpa
       fi
     
-      if [ ! -f $lang_dir/${ngram}gram.fst.txt ]; then
-        python3 -m kaldilm \
-          --read-symbol-table="$lang_dir/tokens.txt" \
-          --disambig-symbol='#0' \
-          --max-order=${ngram} \
-          $lang_dir/${ngram}gram.arpa > $lang_dir/${ngram}gram.fst.txt
-      fi
+      # if [ ! -f $lang_dir/${ngram}gram.fst.txt ]; then
+      #   python3 -m kaldilm \
+      #     --read-symbol-table="$lang_dir/tokens.txt" \
+      #     --disambig-symbol='#0' \
+      #     --max-order=${ngram} \
+      #     $lang_dir/${ngram}gram.arpa > $lang_dir/${ngram}gram.fst.txt
+      # fi
     done
   done
 fi

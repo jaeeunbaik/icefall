@@ -21,10 +21,10 @@ fi
 
 CUDA_VISIBLE_DEVICES=2 python ./conformer_ctc_sd_proj/decode.py \
     --method ctc-decoding \
-    --max-duration 150 \
-    --epoch 3 \
-    --avg 2 \
-    --exp-dir conformer_ctc_sd_proj/finetuning/hybrid/layer_weights/exp_0.5-0.5-1.0/models \
+    --max-duration 100 \
+    --epoch 12 \
+    --avg 4 \
+    --exp-dir conformer_ctc_sd_proj/finetuning/data-aug/exp_musan-rir/models \
     --include-proj-layer False \
     --distill-layers 14
 

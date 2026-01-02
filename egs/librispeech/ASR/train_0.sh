@@ -23,12 +23,12 @@ att_rate=0                    # 0 for pure CTC, >0 for CTC+Attention
 num_decoder_layers=0          # 0 for pure CTC
 
 # Other settings
-start_epoch=0
+start_epoch=7
 master_port=12346
 sanity_check=false           # Set to true for OOM checking (slower)l
-resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/layer_weights/exp_0.3-0.5-0.7/models/averaged_10-20000.pt
+resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/libri-light/exp_1126/3layer/exp_6,12,18/models/averaged_10-20000.pt
 enable_validation=true       # Temporarily disable validation to avoid crashes
-valid_interval=10000           # Much larger interval if we enable validation later
+valid_interval=40000           # Much larger interval if we enable validation later
 
 # Learning Rate Scheduler Settings (Fine-tuning options)
 scheduler_type="noam"       # "noam", "plateau", "constant"
@@ -48,14 +48,14 @@ validation_skip_wer=false              # Skip WER computation for even faster va
 # Distillation Hyperparameters
 enable_self_distillation=true
 distill_layers=6,12,18
-layer_weights=0.3,0.5,0.7
+layer_weights=1.0,1.0,1.0
 distill_loss_type="kl"         # mse, cosine, kl
-alpha=1000
+alpha=100
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
-distill_temperature=4.0
-ema_decay=0.999
+distill_temperature=3.5
+ema_decay=0.9995
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_proj/finetuning/hybrid/layer_weights/exp_0.3-0.5-0.7
+exp_dir=conformer_ctc_sd_proj/finetuning/exp_1126/3layer/exp_6,12,18
 
 
 
@@ -87,7 +87,7 @@ noisy_spec_aug_time_warp_factor=80              # default: 100
 noisy_spec_aug_num_frame_masks=2                # default: 2  
 noisy_spec_aug_features_mask_size=27            # default: 27
 noisy_spec_aug_num_feature_masks=2              # default: 2
-noisy_spec_aug_frames_mask_size=100             # default: 100
+noisy_spec_aug_frames_mask_size=80             # default: 100
 noisy_musan_ratio=0.5                           # default: 0.5
 noisy_snr_range=10,20
 noisy_rir_prob=0.5

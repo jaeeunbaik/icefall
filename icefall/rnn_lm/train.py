@@ -148,7 +148,7 @@ def get_parser():
     parser.add_argument(
         "--vocab-size",
         type=int,
-        default=500,
+        default=1024,
         help="Vocabulary size of the model",
     )
 
@@ -236,7 +236,7 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 100,
             "reset_interval": 2000,
-            "valid_interval": 200,
+            "valid_interval": 40000,
             "env_info": get_env_info(),
         }
     )
@@ -398,7 +398,6 @@ def compute_validation_loss(
     model.eval()
 
     tot_loss = MetricsTracker()
-
     for batch_idx, batch in enumerate(valid_dl):
         x, y, sentence_lengths = batch
         with torch.cuda.amp.autocast(enabled=params.use_fp16):

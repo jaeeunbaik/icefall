@@ -35,12 +35,15 @@ from icefall.decode import (
     get_lattice,
     nbest_decoding,
     nbest_oracle,
+    nbest_rescore_with_LM,
     one_best_decoding,
     rescore_with_attention_decoder,
     rescore_with_n_best_list,
     rescore_with_rnn_lm,
     rescore_with_whole_lattice,
 )
+from rnn_lm_rescore import rescore_with_rnn_lm_no_decoder
+from ngram_rnn_rescore import nbest_rescore_with_ngram_and_rnn
 from icefall.env import get_env_info
 from icefall.rnn_lm.model import RnnLmModel
 from icefall.utils import (
@@ -247,7 +250,7 @@ def get_parser():
     parser.add_argument(
         "--lm-dir",
         type=str,
-        default="/home/hdd1/jenny/lm",
+        default="data/lm_bpe_1024",
         help="""The n-gram LM dir.
         It should contain either G_4_gram.pt or G_4_gram.fst.txt
         """,
@@ -256,7 +259,7 @@ def get_parser():
     parser.add_argument(
         "--rnn-lm-exp-dir",
         type=str,
-        default="rnn_lm/exp",
+        default="/home/hdd2/jenny/ASRToolkit/icefall/icefall/rnn_lm/exp",
         help="""Used only when --method is rnn-lm.
         It specifies the path to RNN LM exp dir.
         """,
@@ -265,7 +268,7 @@ def get_parser():
     parser.add_argument(
         "--rnn-lm-epoch",
         type=int,
-        default=7,
+        default="0",
         help="""Used only when --method is rnn-lm.
         It specifies the checkpoint to use.
         """,
@@ -297,7 +300,7 @@ def get_parser():
     parser.add_argument(
         "--rnn-lm-num-layers",
         type=int,
-        default=4,
+        default=3,
         help="Number of RNN layers the model",
     )
     parser.add_argument(
@@ -311,7 +314,7 @@ def get_parser():
     parser.add_argument(
         "--include-proj-layer",
         type=str2bool,
-        default=True,
+        default=False,
         help="""True to include projection layer when decoding"""
     )
     parser.add_argument(
@@ -483,6 +486,18 @@ def decode_one_batch(
         import traceback
         logging.error(f"Traceback: {traceback.format_exc()}")
         raise e
+    
+    # For LM rescoring methods, initialize lm_scores to preserve original acoustic scores
+    if params.method in (
+        "nbest-rescoring",
+        "attention-decoder",
+        "rnn-lm",
+    ):
+        if not hasattr(lattice, "lm_scores"):
+            # Initialize lm_scores with zeros (no LM contribution initially)
+            # The actual LM scores will be added during rescoring
+            lattice.lm_scores = torch.zeros_like(lattice.scores)
+    
     if params.method == "ctc-decoding":
         # Step 4: CTC decoding
         best_path = one_best_decoding(
@@ -543,36 +558,43 @@ def decode_one_batch(
 
     assert params.method in [
         "nbest-rescoring",
-        "whole-lattice-rescoring",
         "attention-decoder",
         "rnn-lm",
-    ]
+    ], f"Unsupported method for BPE-based CTC: {params.method}. Use 'nbest-rescoring' instead of 'whole-lattice-rescoring'."
 
+    # LM Scale 설정:
+    # Option 1: 단일 scale (빠름, 최적 scale을 이미 알 때)
+    # lm_scale_list = [0.8]
+    
+    # Option 2: 몇 개만 테스트 (중간)
+    # lm_scale_list = [0.5, 0.7, 0.9, 1.1, 1.3]
+    
+    # Option 3: 전체 범위 테스트 (느리지만 최적값 찾기)
     lm_scale_list = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
     lm_scale_list += [0.8, 0.9, 1.0, 1.1, 1.2, 1.3]
     lm_scale_list += [1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]
 
     if params.method == "nbest-rescoring":
-        best_path_dict = rescore_with_n_best_list(
+        # Use nbest_rescore_with_LM for token-level n-gram rescoring
+        best_path_dict = nbest_rescore_with_LM(
             lattice=lattice,
-            G=G,
+            LM=G,  # Token-level 4-gram LM
             num_paths=params.num_paths,
             lm_scale_list=lm_scale_list,
             nbest_scale=params.nbest_scale,
         )
-    elif params.method == "whole-lattice-rescoring":
-        best_path_dict = rescore_with_whole_lattice(
-            lattice=lattice,
-            G_with_epsilon_loops=G,
-            lm_scale_list=lm_scale_list,
-        )
     elif params.method == "attention-decoder":
-        # lattice uses a 3-gram Lm. We rescore it with a 4-gram LM.
-        rescored_lattice = rescore_with_whole_lattice(
+        # For BPE-based CTC, use token-level n-gram rescoring first
+        # Then apply attention decoder rescoring
+        rescored_lattice = nbest_rescore_with_LM(
             lattice=lattice,
-            G_with_epsilon_loops=G,
-            lm_scale_list=None,
+            LM=G,  # Token-level 4-gram LM
+            num_paths=params.num_paths,
+            lm_scale_list=[1.0],  # Use fixed LM scale for intermediate step
+            nbest_scale=params.nbest_scale,
         )
+        # Get the best path with lm_scale=1.0
+        rescored_lattice = rescored_lattice["lm_scale_1.0"]
 
         best_path_dict = rescore_with_attention_decoder(
             lattice=rescored_lattice,
@@ -585,24 +607,24 @@ def decode_one_batch(
             nbest_scale=params.nbest_scale,
         )
     elif params.method == "rnn-lm":
-        # lattice uses a 3-gram Lm. We rescore it with a 4-gram LM.
-        rescored_lattice = rescore_with_whole_lattice(
+        # For BPE-based CTC: Combined n-gram + RNN LM rescoring
+        # This extracts n-best paths and rescores with both n-gram and RNN LM
+        
+        # Add "tokens" attribute to lattice (copy from labels)
+        if not hasattr(lattice, "tokens"):
+            lattice.tokens = lattice.labels.clone()
+        
+        best_path_dict = nbest_rescore_with_ngram_and_rnn(
             lattice=lattice,
-            G_with_epsilon_loops=G,
-            lm_scale_list=None,
-        )
-
-        best_path_dict = rescore_with_rnn_lm(
-            lattice=rescored_lattice,
-            num_paths=params.num_paths,
+            ngram_lm=G,  # Token-level n-gram LM
             rnn_lm_model=rnn_lm_model,
-            model=model,
-            memory=memory,
-            memory_key_padding_mask=memory_key_padding_mask,
+            num_paths=params.num_paths,
+            blank_id=0,
             sos_id=sos_id,
             eos_id=eos_id,
-            blank_id=0,
             nbest_scale=params.nbest_scale,
+            ngram_lm_scale=0.8,  # N-gram weight (tune this!)
+            rnn_lm_scale=0.5,    # RNN LM weight (tune this!)
         )
     else:
         assert False, f"Unsupported decoding method: {params.method}"
@@ -610,8 +632,21 @@ def decode_one_batch(
     ans = dict()
     if best_path_dict is not None:
         for lm_scale_str, best_path in best_path_dict.items():
-            hyps = get_texts(best_path)
-            hyps = [[word_table[i] for i in ids] for ids in hyps]
+            # Get token IDs from best path
+            token_ids = get_texts(best_path)
+            
+            
+            # For BPE-based methods, use sentencepiece to decode
+            if bpe_model is not None:
+                # Decode using BPE model
+                hyps = bpe_model.decode(token_ids)
+                # Split into words
+                hyps = [s.split() for s in hyps]
+            else:
+                logging.info("Using word_table to decode")
+                # For phone-based methods, use word_table
+                hyps = [[word_table[i] for i in ids] for ids in token_ids]
+            
             ans[lm_scale_str] = hyps
     else:
         ans = None
@@ -1051,7 +1086,23 @@ def main():
         )
         bpe_model = spm.SentencePieceProcessor()
         bpe_model.load(str(params.lang_dir / "bpe.model"))
+    elif params.method in (
+        "nbest-rescoring",
+        "attention-decoder",
+        "rnn-lm",
+    ):
+        # BPE-based LM rescoring methods (token-level n-gram LM)
+        # Note: whole-lattice-rescoring requires word-level LM and is not compatible with CTC
+        HLG = None
+        H = k2.ctc_topo(
+            max_token=max_token_id,
+            modified=False,
+            device=device,
+        )
+        bpe_model = spm.SentencePieceProcessor()
+        bpe_model.load(str(params.lang_dir / "bpe.model"))
     else:
+        # Phone-based methods (1best, nbest, nbest-oracle)
         H = None
         bpe_model = None
         HLG = k2.Fsa.from_dict(
@@ -1068,29 +1119,33 @@ def main():
         "attention-decoder",
         "rnn-lm",
     ):
-        if not (params.lm_dir / "G_4_gram.pt").is_file():
-            logging.info("Loading G_4_gram.fst.txt")
-            logging.warning("It may take 8 minutes.")
-            with open(params.lm_dir / "G_4_gram.fst.txt") as f:
-                # For BPE mode: use a default disambig ID (assuming #0 maps to ID 0)
-                first_word_disambig_id = 0  # This should be adjusted based on your BPE vocab
-
-                G = k2.Fsa.from_openfst(f.read(), acceptor=False)
-                # G.aux_labels is not needed in later computations, so
-                # remove it here.
-                del G.aux_labels
-                # CAUTION: The following line is crucial.
-                # Arcs entering the back-off state have label equal to #0.
-                # We have to change it to 0 here.
-                G.labels[G.labels >= first_word_disambig_id] = 0
-                # See https://github.com/k2-fsa/k2/issues/874
-                # for why we need to set G.properties to None
-                G.__dict__["_properties"] = None
-                G = k2.Fsa.from_fsas([G]).to(device)
-                G = k2.arc_sort(G)
-                # Save a dummy value so that it can be loaded in C++.
-                # See https://github.com/pytorch/pytorch/issues/67902
-                # for why we need to do this.
+        # N-gram Order 선택:
+        # 2-gram: 빠르지만 성능 낮음
+        # 3-gram: 균형 (속도 ↔ 성능)
+        # 4-gram: 추천! (성능 좋음, 속도 적당)
+        # 5-gram: 성능 최고, 메모리/속도 느림
+        
+        ngram_order = 4  # ← 이 값을 변경하세요 (2, 3, 4, 5)
+        lm_filename = f"data/lm_bpe_1024/G_{ngram_order}_gram.pt"
+        logging.info(f"Loading token-level {ngram_order}-gram LM: {lm_filename}")
+        
+        if not Path(lm_filename).is_file():
+            raise FileNotFoundError(
+                f"{lm_filename} not found. Please run: "
+                "bash prepare_token_ngram_lms.sh"
+            )
+        
+        G = k2.Fsa.from_dict(torch.load(lm_filename, map_location="cpu"))
+        G = k2.arc_sort(G)
+        G = G.to(device)
+        
+        logging.info(f"Token-level LM loaded: shape={G.shape}")
+        
+        # For compatibility with old code that saves G
+        if False:  # Skip saving
+            # Save a dummy value so that it can be loaded in C++.
+            # See https://github.com/pytorch/pytorch/issues/67902
+            # for why we need to do this.
                 G.dummy = 1
 
                 torch.save(G.as_dict(), params.lm_dir / "G_4_gram.pt")
@@ -1107,7 +1162,16 @@ def main():
             # Add epsilon self-loops to G as we will compose
             # it with the whole lattice later
             G = k2.add_epsilon_self_loops(G)
+            G = k2.connect(G)  # Ensure FSA is connected
             G = k2.arc_sort(G)
+            # Top-sort to ensure start state is in the first batch
+            # This fixes: "start_state_present[0] == 1" error
+            try:
+                G = k2.top_sort(G)
+            except RuntimeError as e:
+                logging.warning(f"Failed to top-sort G after epsilon loops: {e}")
+                # If top-sort fails, try without it and hope for the best
+                pass
             G = G.to(device)
 
         # G.lm_scores is used to replace HLG.lm_scores during
@@ -1215,6 +1279,7 @@ def main():
                 params.rnn_lm_epoch,
                 params.rnn_lm_avg,
                 device,
+                strict=True,
             )
         rnn_lm_model.eval()
 

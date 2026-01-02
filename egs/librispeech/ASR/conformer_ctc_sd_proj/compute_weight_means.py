@@ -61,8 +61,8 @@ def compute_mean_model(avg, epoch, model_fld, save_name):
     print(f"평균 모델 저장 완료(안전 포맷): {save_name}")
     
 if __name__=='__main__':
-    avg = 6
-    epoch = 5
-    model_fld = '/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/finetuning/hybrid/layer_weights/exp_0.7-0.5-0.3/models'
-    save_name = '/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/finetuning/hybrid/layer_weights/exp_0.7-0.5-0.3/models/averaged-epoch5-avg6.pt'
+    avg = 3
+    epoch = 6
+    model_fld = '/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/finetuning/data-aug/exp_specaug-rir/models'
+    save_name = '/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/conformer_ctc_sd_proj/finetuning/data-aug/exp_specaug-rir/models/averaged-epoch3-avg6.pt'
     compute_mean_model(avg, epoch, model_fld, save_name)

@@ -8,16 +8,10 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 
 set -euo pipefail
 
-# Data Augmentation Controls (modify these as needed)
-enable_spec_aug=false          # SpecAugment (frequency/time masking)
-enable_musan=false             # MUSAN noise augmentation
-enable_cutmix=false 
-enable_cutmix=false 
-enable_concatenate=false   
 
 # Training parameters
 world_size=1 
-max_duration=400
+max_duration=320
 valid_max_duration=15         
 num_buckets=300               
 num_workers=6    
@@ -30,11 +24,11 @@ num_decoder_layers=0          # 0 for pure CTC
 
 # Other settings
 start_epoch=0
-master_port=12345
-sanity_check=false           # Set to true for OOM checking (slower)
-resume_from=/home/hdd2/jenny/ASRToolkit/icefall/egs/librispeech/ASR/zoo/conformer_ctc_70000_from77avg10.pt
+master_port=12346
+sanity_check=false           # Set to true for OOM checking (slower)l
+resume_from=/home/nas4/user/jaeeun/icefall/egs/librispeech/ASR/zoo/finetuning/data-aug/exp_musan/models/averaged_10-20000.pt
 enable_validation=true       # Temporarily disable validation to avoid crashes
-valid_interval=500000           # Much larger interval if we enable validation later
+valid_interval=10000           # Much larger interval if we enable validation later
 
 # Learning Rate Scheduler Settings (Fine-tuning options)
 scheduler_type="noam"       # "noam", "plateau", "constant"
@@ -52,30 +46,64 @@ validation_output_beam=5.0             # Output beam for validation (only used i
 validation_skip_wer=false              # Skip WER computation for even faster validation (디버깅용 - 이제 false로 변경)
 
 # Distillation Hyperparameters
-enable_self_distillation=True
-distill_layers=5,11,17
+enable_self_distillation=true
+distill_layers=6,18
+layer_weights=1.0,1.0
 distill_loss_type="kl"         # mse, cosine, kl
 alpha=1000
 distill_aggregation=output_avg       # layer_avg: layer 출력을 평균 내고 비교, output_avg: 각 layer loss를 평균
 distill_temperature=4.0
 ema_decay=0.999
 ema_start_step=1000
-exp_dir=conformer_ctc_sd_proj/pretrained_6,12,18/exp_ft_avg5_specaug_rir_usingtrainpy
+exp_dir=conformer_ctc_sd_proj/finetuning/data-aug/exp_musan
+
+
+
+# Data Augmentation Controls (modify these as needed)
+clean_enable_spec_aug=false          # SpecAugment (frequency/time masking)
+clean_enable_musan=false             # MUSAN noise augmentation
+clean_enable_cutmix=false 
+clean_enable_concatenate=false
+clean_enable_rir=false
+
+clean_spec_aug_time_warp_factor=80              # default: 100
+clean_spec_aug_num_frame_masks=2                # default: 2  
+clean_spec_aug_features_mask_size=27            # default: 27
+clean_spec_aug_num_feature_masks=10              # default: 2
+clean_spec_aug_frames_mask_size=100             # default: 100
+clean_musan_ratio=0.5                           # default: 0.5
+clean_snr_range=10,20
+clean_rir_prob=0.5
+
+
+# Data Augmentation Controls (modify these as needed)
+noisy_enable_spec_aug=true          # SpecAugment (frequency/time masking)
+noisy_enable_musan=false             # MUSAN noise augmentation
+noisy_enable_cutmix=false 
+noisy_enable_concatenate=false
+noisy_enable_rir=false
+
+noisy_spec_aug_time_warp_factor=80              # default: 100
+noisy_spec_aug_num_frame_masks=2                # default: 2  
+noisy_spec_aug_features_mask_size=27            # default: 27
+noisy_spec_aug_num_feature_masks=2              # default: 2
+noisy_spec_aug_frames_mask_size=100             # default: 100
+noisy_musan_ratio=0.5                           # default: 0.5
+noisy_snr_range=10,20
+noisy_rir_prob=0.5
+
 
 #
-spec_aug_time_warp_factor=80              # default: 100
-spec_aug_num_frame_masks=2                # default: 2  
-spec_aug_features_mask_size=27            # default: 27
-spec_aug_num_feature_masks=2              # default: 2
-spec_aug_frames_mask_size=100             # default: 100
-musan_ratio=0.5                           # default: 0.5
-snr_range=10,20
+use_proj_layer=true
+return_cuts=true
+on_the_fly_feats=false
+learning_type="hybrid"
+clean_ratio=0.1
+dataset_type="auto"
+prototype_dir="./prototypes/librilight-512"
+num_prototypes=512
+prototype_samples=100000
 
-#
-use_proj_layer=False
-return_cuts=False
-on_the_fly_feats=True
-learning_type="encoder-only"
 
 if [ -z "${PYTHONPATH:-}" ]; then
     export PYTHONPATH="/tmp/icefall"
@@ -83,7 +111,7 @@ else
     export PYTHONPATH="${PYTHONPATH}:/tmp/icefall"
 fi
 
-CUDA_VISIBLE_DEVICES=3 python3 ./conformer_ctc_sd_proj/train.py \
+CUDA_VISIBLE_DEVICES=0 python3 ./conformer_ctc_sd_proj/train.py \
     --exp-dir $exp_dir \
     --master-port $master_port \
     --sanity-check $sanity_check \
@@ -94,13 +122,10 @@ CUDA_VISIBLE_DEVICES=3 python3 ./conformer_ctc_sd_proj/train.py \
     --att-rate $att_rate \
     --num-decoder-layers $num_decoder_layers \
     --num-workers $num_workers \
-    --enable-spec-aug $enable_spec_aug \
-    --enable-musan $enable_musan \
     --max-duration $max_duration \
     --valid-max-duration $valid_max_duration \
     --num-buckets $num_buckets \
-    --bucketing-sampler false \
-    --concatenate-cuts $enable_concatenate \
+    --bucketing-sampler true \
     --duration-factor 1.0 \
     --drop-last true \
     --shuffle false \
@@ -126,3 +151,29 @@ CUDA_VISIBLE_DEVICES=3 python3 ./conformer_ctc_sd_proj/train.py \
     --return-cuts $return_cuts \
     --on-the-fly-feats $on_the_fly_feats \
     --learning-type $learning_type \
+    --clean-enable-spec-aug $clean_enable_spec_aug \
+    --clean-enable-musan $clean_enable_musan \
+    --clean-enable-cutmix $clean_enable_cutmix \
+    --clean-enable-concatenate $clean_enable_concatenate \
+    --clean-enable-rir $clean_enable_rir \
+    --clean-spec-aug-time-warp-factor $clean_spec_aug_time_warp_factor \
+    --clean-spec-aug-num-frame-masks $clean_spec_aug_num_frame_masks \
+    --clean-spec-aug-features-mask-size $clean_spec_aug_features_mask_size \
+    --clean-spec-aug-num-feature-masks $clean_spec_aug_num_feature_masks \
+    --clean-spec-aug-frames-mask-size $clean_spec_aug_frames_mask_size \
+    --clean-musan-ratio $clean_musan_ratio \
+    --clean-snr-range $clean_snr_range \
+    --clean-rir-prob $clean_rir_prob \
+    --noisy-enable-spec-aug $noisy_enable_spec_aug \
+    --noisy-enable-musan $noisy_enable_musan \
+    --noisy-enable-cutmix $noisy_enable_cutmix \
+    --noisy-enable-concatenate $noisy_enable_concatenate \
+    --noisy-enable-rir $noisy_enable_rir \
+    --noisy-spec-aug-time-warp-factor $noisy_spec_aug_time_warp_factor \
+    --noisy-spec-aug-num-frame-masks $noisy_spec_aug_num_frame_masks \
+    --noisy-spec-aug-features-mask-size $noisy_spec_aug_features_mask_size \
+    --noisy-spec-aug-num-feature-masks $noisy_spec_aug_num_feature_masks \
+    --noisy-spec-aug-frames-mask-size $noisy_spec_aug_frames_mask_size \
+    --noisy-musan-ratio $noisy_musan_ratio \
+    --noisy-snr-range $noisy_snr_range \
+    --noisy-rir-prob $noisy_rir_prob
